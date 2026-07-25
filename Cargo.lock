@@ -415,7 +415,6 @@ dependencies = [
 name = "rm-weread"
 version = "0.1.0"
 dependencies = [
- "base64",
  "md-5",
  "serde",
  "serde_json",
