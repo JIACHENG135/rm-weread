@@ -84,13 +84,51 @@ src/bin/weread_daemon.rs（复用 rm-agent 的 translate_daemon.rs/vocab_daemon.
     段落/range id（不需要我之前设计里那套 quote-text 模糊匹配兜底方案，
     因为锚点数据是微信读书 API 免费给的）
 
-QML 阅读器 app（不是 rm-agent 的 xovi/three_finger_translate.qmd 那种
-  "patch 进 xochitl"的小 overlay，而是独立全屏 app）
-  - 通过 XOVI 的 AppLoad 启动器接入（REweread 也是这个机制），不是走
-    qt-resource-rebuilder 的 .qmd diff-patch 技术——两者是 XOVI 里不同的
-    机制，patch 技术是给"在 xochitl 里加一个小功能"用的，AppLoad 是给
-    "启动一个独立 app，暂停 xochitl"用的，这次场景对应后者
+QML 阅读器（走 qt-resource-rebuilder 的 .qmd diff-patch，跟 rm-agent 的
+  xovi/three_finger_translate.qmd 同一套机制，**不是** AppLoad 独立 app）
+  - 本质上是把 three_finger_translate.qmd 已经验证过的写法放大：往
+    xochitl 现有 QML 树里注入一个平时 visible:false 的 Item，靠 trigger
+    文件切换显隐。区别只是这个 Item 从一个小弹窗变成占满全屏的阅读器
+  - 决策见下面"为什么走 patch 而不是 AppLoad"一节——这是一个明确接受了
+    代价的选择，不是默认选项
 ```
+
+## 为什么走 patch 而不是 AppLoad
+
+XOVI 里有两套不同的机制：qt-resource-rebuilder 的 .qmd diff-patch（往
+xochitl 已有界面里注入东西），和 AppLoad（装一个有自己图标、自己进程、
+自己生命周期的独立 app，REweread 用的就是这套）。按"独立全屏阅读器"这
+个产品形态，AppLoad 才是它设计出来要解决的场景。
+
+**但这里选 patch**，理由和代价都写清楚：
+
+- **省掉一整个未知数**：AppLoad 的 README 开头就写着它是 "a xovi
+  extension for the **RMPP**"，依赖的仓库也叫 `rmpp-xovi-extensions`/
+  `rmpp-appload`，很可能是 Paper Pro 专属、不支持 rM2（armv7）。走 patch
+  这条路直接绕开这个问题，不用去验证、也不用为两种设备准备两套接入方式
+- **机制已经在真机上验证过**：rm-agent 的三指翻译/生词卡片就是这么做
+  的，deploy.sh 里那套"改 .qmd → 用 qmldiff 按固件 hashtable 哈希 →
+  先跑 xovi/debug 前台验证 → 再切 xovi/start 持久化"的流程可以整套复用
+
+### 代价（明确接受，不是"以后再说"）
+
+1. **没有进程隔离——这是最大的一条**。AppLoad 的 app 崩了不影响
+   xochitl；patch 进去的 QML/JS 是跑在 xochitl 自己进程里的。现有那几个
+   小弹窗逻辑很薄（显示几行文字），出错概率低；这次要塞进去的是完整书架
+   + 分页阅读器 + 图片渲染，复杂度高一个量级。这块 QML 一旦出问题，拖垮
+   的是**整个 xochitl**——rm-agent 的 deploy.sh 里已经记着前车之鉴：一次
+   QML 属性名写错直接把设备搞成"重启循环"。风险随塞进去的东西变多而放
+   大，所以 `xovi/debug` 前台验证这一步在这个项目里是硬性的，不能跳
+2. **全屏事件捕获要自己做**：阅读器打开期间所有触摸/笔迹事件都不能漏到
+   底下的 xochitl 页面（翻页手势不能同时翻底下的文档）。需要一个覆盖全屏
+   的高 z-order 捕获层，做起来不难，但边界情况（笔迹落在捕获层边缘等）
+   必须真机验证
+3. **入口要自己造**：AppLoad 天然有主屏图标，patch 没有。"怎么从主屏进
+   到阅读器"得自己解决——往 xochitl 文件浏览器界面补个按钮，或复用现成的
+   角落多指手势入口，本质上又是一次小 patch
+4. **补丁越大越脆弱**：hashtable 不能跨固件版本复用（deploy.sh 已记录），
+   每次固件升级都要重新验证；补丁体量越大，每次改完过一遍 debug 验证的
+   成本越高
 
 ## 数据落地（全部在设备本地，没有一处是"我们自己的后端"）
 
@@ -123,7 +161,9 @@ QML 阅读器 app（不是 rm-agent 的 xovi/three_finger_translate.qmd 那种
    应该解出同一段明文，可以脱离设备直接写单测）
 3. 窄范围分页/排版：只服务微信读书自己的 chapter 格式，比通用 EPUB 引
    擎小得多
-4. XOVI AppLoad 接入：复用 REweread 已经验证过的接入方式，不是自己发明
+4. QML 补丁（书架 + 全屏阅读器 + 事件捕获层 + 入口）：机制和 deploy 流程
+   照抄 rm-agent 的 three_finger_translate.qmd，但补丁体量大得多，见上面
+   "为什么走 patch 而不是 AppLoad"的代价清单
 5. **抄写法**（不是共享代码，见上面"仓库关系"）：圈画+三指点击手势链
    路、文件触发/轮询 IPC 模式、systemd + `deploy.sh` 设备部署流程、
    `gemini.rs` 的 HTTP 客户端写法作为 `weread_client.rs` 的模板
@@ -261,8 +301,17 @@ koplugin 展示"点击划线弹出想法"的方式很巧妙：下载时把想法
    真实请求发的是带 `.0` 后缀的字符串（如 `"1522756.0"`），不是纯整数——
    用整数运算算出数值后手动拼 `.0` 后缀实现的，没有经过 `f64`（Rust 的
    `f64` Display 对整数值不会自动带 `.0`，直接用会漏掉这个后缀）。
-4. 最小分页渲染 + QML 阅读器 app + AppLoad 接入，先跑通"打开一本书翻页"
-   ← **当前阶段**
+4. 最小分页渲染 + QML 阅读器补丁，先跑通"打开一本书翻页"
+   ← **当前阶段**。走 .qmd diff-patch 而不是 AppLoad（决策和代价见上面
+   "为什么走 patch 而不是 AppLoad"）。子步骤：
+   - Rust 侧：把解码出的 XHTML 转成"当前页文本"（窄范围分页，只服务微信
+     读书这一种 chapter 格式），`weread_daemon` 通过结果文件喂给 QML
+   - QML 侧：全屏 Item（默认 visible:false）+ 高 z-order 事件捕获层 +
+     翻页手势
+   - 入口：先用最省事的方式（角落多指手势，复用 rm-agent 已验证的写法），
+     不做主屏图标
+   - 每次改完必须先 `xovi/debug` 前台验证再持久化——这个项目补丁体量大，
+     跳过这步的后果是整个 xochitl 崩
 5. **设备原生登录 UI**——阶段 1 现在的登录方式（CLI 打印链接，人在另一台
    电脑上用 `qrencode` 生成图片看）只是验证协议用的脚手架，**不是最终产
    品该有的样子**：如果手头只有 rmb、没有电脑，这套完全没法用。真正要做
@@ -278,7 +327,7 @@ koplugin 展示"点击划线弹出想法"的方式很巧妙：下载时把想法
    - `NEED_OTP` 那步不需要手写识别：reMarkable 没有物理键盘，但 4 位数
      字验证码用一个简单的 QML 数字键盘（点数字）就够了，没必要上 OCR
    - 这一步是可用性的硬前提（没有它，设备离开电脑就没法首次登录），不
-     是锦上添花，得跟阶段 4 的 QML app 一起做，不能拖到最后
+     是锦上添花，得跟阶段 4 的 QML 补丁一起做，不能拖到最后
 6. 批注（复用现有手势链路——到这一步再定手势追踪代码怎么在两个仓库间
    共享）
 7. 热门划线/评论（按需拉取 + REweread 的防御性节流策略）
