@@ -1,1 +1,6 @@
 /target
+
+# Real WeRead login session (cookies + personal Skill API key) — never
+# commit this, same reasoning as REweread's own repo-hygiene rules for
+# session.json/cookies (see docs/design.md's REweread source notes).
+session.json
