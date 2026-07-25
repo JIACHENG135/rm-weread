@@ -1,0 +1,211 @@
+AFFECT /qml/device/view/documentview/SceneViewGestures.qml
+IMPORT net.asivery.CommandExecutor 1.0
+    TRAVERSE TouchArea
+        LOCATE BEFORE ALL
+    INSERT {
+        // Fullscreen WeRead reader, patched into xochitl's existing QML
+        // tree via qt-resource-rebuilder (see docs/design.md §"为什么走
+        // patch 而不是 AppLoad"). Same mechanism as rm-agent's
+        // three_finger_translate.qmd — a normally-hidden Item plus
+        // file-based IPC with a native daemon — just scaled up from a
+        // small popup to a fullscreen surface.
+        //
+        // NOTE: every comment in this file has to live inside this
+        // INSERT block. The .qmd grammar only accepts AFFECT / SLOT /
+        // VERSION / TEMPLATE at the top level, so a `//` line before
+        // AFFECT makes qmldiff reject the whole file ("expected AFFECT
+        // ... got Identifier(\"//\")") — confirmed on device. It fails
+        // safely (the patch just doesn't load) but silently, so the
+        // reader would simply never appear.
+        //
+        // A SEPARATE .qmd from rm-agent's, deliberately:
+        // qt-resource-rebuilder iterates the directory and loads every
+        // .qmd it finds (also confirmed on device — both files show up
+        // as "Loading file ..."), so the two projects' patches coexist
+        // without either repo knowing about the other's file, and
+        // without repeating the "two copies of one .qmd drift apart"
+        // incident.
+        //
+        // This QML runs INSIDE xochitl's process. A mistake here doesn't
+        // just break the reader, it can crash xochitl into a reboot
+        // loop — always validate with `xovi/debug` in the foreground
+        // before making it persistent.
+        //
+        // Rust does the line wrapping (paginate.rs); this file renders
+        // the already-wrapped lines verbatim and must never re-wrap
+        // them, or the character offsets annotations depend on stop
+        // matching what's on screen.
+
+        // Four fingers, so it can't be confused with rm-agent's
+        // three-finger translate gesture patched into this same file.
+        TouchAreaClickFilter {
+            id: weReadOpenFilter
+            palmAreaThreshold: touchArea.tapPalmThreshold
+            enabled: !touchArea.panAndZoomOnly
+            fingers: 4
+            onClick: {
+                weReadReader.visible = true;
+                weReadReader.statusText = "正在打开…";
+                weReadReader.bodyText = "";
+                weReadReader.lastSeq = weReadReader.readSeq();
+                weReadCmd.executeCommand("/bin/touch", ["/home/root/xovi/exthome/weread/open"]);
+                weReadPoller.start();
+            }
+        }
+
+        CommandExecutor {
+            id: weReadCmd
+        }
+
+        FontLoader {
+            id: weReadFont
+            source: "file:///home/root/xovi/exthome/weread/NotoSansSC.ttf"
+        }
+
+        Rectangle {
+            id: weReadReader
+            visible: false
+            // Above rm-agent's translate popup (z: 1000) so the two can
+            // never fight over the screen.
+            z: 2000
+            color: "white"
+            width: touchArea.width
+            height: touchArea.height
+            x: 0
+            y: 0
+
+            property int lastSeq: 0
+            property string statusText: ""
+            property string titleText: ""
+            property string pageInfo: ""
+            property string bodyText: ""
+
+            function readResultFile() {
+                var xhr = new XMLHttpRequest();
+                try {
+                    xhr.open("GET", "file:///home/root/xovi/exthome/weread/page.txt", false);
+                    xhr.send();
+                    return xhr.responseText || "";
+                } catch (e) {
+                    return "";
+                }
+            }
+
+            function readSeq() {
+                var raw = readResultFile();
+                var n = parseInt(raw.split("\n")[0]);
+                return isNaN(n) ? 0 : n;
+            }
+
+            // Swallows every touch inside the reader so nothing reaches
+            // the document underneath — without this, a page-turn tap
+            // would also flip the real document behind us.
+            MouseArea {
+                id: weReadCapture
+                anchors.fill: parent
+                onClicked: (mouse) => {
+                    if (mouse.y < weReadReader.height * 0.12) {
+                        // Top strip closes.
+                        weReadReader.visible = false;
+                        weReadPoller.stop();
+                        weReadCmd.executeCommand("/bin/touch", ["/home/root/xovi/exthome/weread/close"]);
+                        return;
+                    }
+                    var file = mouse.x < weReadReader.width * 0.35
+                        ? "/home/root/xovi/exthome/weread/prev"
+                        : "/home/root/xovi/exthome/weread/next";
+                    weReadReader.lastSeq = weReadReader.readSeq();
+                    weReadCmd.executeCommand("/bin/touch", [file]);
+                    weReadPoller.start();
+                }
+            }
+
+            Text {
+                id: weReadTitle
+                anchors.top: parent.top
+                anchors.topMargin: 40
+                anchors.horizontalCenter: parent.horizontalCenter
+                font.family: weReadFont.name
+                font.pixelSize: 26
+                color: "#606060"
+                text: weReadReader.titleText
+            }
+
+            Text {
+                id: weReadBody
+                anchors.top: parent.top
+                anchors.topMargin: 110
+                anchors.left: parent.left
+                anchors.leftMargin: 60
+                anchors.right: parent.right
+                anchors.rightMargin: 60
+                font.family: weReadFont.name
+                font.pixelSize: 34
+                lineHeight: 1.45
+                color: "black"
+                // Rust already wrapped these lines to fit; re-wrapping
+                // here would desync the on-screen text from the
+                // character offsets annotations rely on.
+                wrapMode: Text.NoWrap
+                textFormat: Text.PlainText
+                text: weReadReader.bodyText
+            }
+
+            Text {
+                id: weReadStatus
+                anchors.centerIn: parent
+                font.family: weReadFont.name
+                font.pixelSize: 30
+                color: "#808080"
+                visible: weReadReader.statusText.length > 0
+                text: weReadReader.statusText
+            }
+
+            Text {
+                id: weReadFooter
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: 36
+                anchors.horizontalCenter: parent.horizontalCenter
+                font.family: weReadFont.name
+                font.pixelSize: 22
+                color: "#909090"
+                text: weReadReader.pageInfo
+            }
+        }
+
+        Timer {
+            id: weReadPoller
+            interval: 300
+            repeat: true
+            property int elapsedMs: 0
+            onTriggered: {
+                elapsedMs += interval;
+                var raw = weReadReader.readResultFile();
+                var lines = raw.split("\n");
+                var seq = parseInt(lines[0]);
+                if (!isNaN(seq) && seq > weReadReader.lastSeq) {
+                    weReadReader.lastSeq = seq;
+                    var status = lines.length > 1 ? lines[1] : "";
+                    weReadReader.titleText = lines.length > 2 ? lines[2] : "";
+                    weReadReader.pageInfo = lines.length > 3 ? lines[3] : "";
+                    if (status === "page") {
+                        weReadReader.statusText = "";
+                        weReadReader.bodyText = lines.length > 4 ? lines.slice(4).join("\n") : "";
+                    } else {
+                        weReadReader.statusText = lines.length > 4 ? lines.slice(4).join("\n") : "(出错)";
+                        weReadReader.bodyText = "";
+                    }
+                    elapsedMs = 0;
+                    stop();
+                    return;
+                }
+                if (elapsedMs > 30000) {
+                    weReadReader.statusText = "(超时，请重试)";
+                    elapsedMs = 0;
+                    stop();
+                }
+            }
+        }
+    }
+    END TRAVERSE
+END AFFECT

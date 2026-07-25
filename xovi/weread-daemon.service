@@ -1,0 +1,13 @@
+[Unit]
+Description=weread_daemon (fullscreen WeRead reader backend for the XOVI QML patch)
+After=xovi-start.service xochitl.service
+Requires=xovi-start.service xochitl.service
+
+[Service]
+Type=simple
+ExecStart=/home/root/weread_daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
