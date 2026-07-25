@@ -1,0 +1,10 @@
+[target.armv7-unknown-linux-musleabihf]
+linker = "armv7-unknown-linux-musleabihf-gcc"
+
+# reMarkable Paper Pro (aarch64) — build with
+# `cargo build --target aarch64-unknown-linux-musl`.
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-unknown-linux-musl-gcc"
+
+[build]
+target = "armv7-unknown-linux-musleabihf"
