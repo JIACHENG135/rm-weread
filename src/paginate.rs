@@ -16,6 +16,11 @@
 #[derive(Debug, Clone, PartialEq)]
 pub struct Page {
     pub lines: Vec<String>,
+    /// Absolute character offset (into the chapter plain text) where
+    /// each line in `lines` begins — same length as `lines`. The PDF
+    /// layout (layout.rs) needs per-line offsets to place underlines,
+    /// not just the page-level range.
+    pub line_starts: Vec<usize>,
     pub start: usize,
     pub end: usize,
 }
@@ -23,7 +28,7 @@ pub struct Page {
 /// Rough width of one character in "columns", where a CJK glyph is 2 and
 /// a Latin one is 1 — the standard monospace-ish approximation, and close
 /// enough for a fixed-width e-ink layout.
-fn char_width(c: char) -> usize {
+pub fn char_width(c: char) -> usize {
     let cp = c as u32;
     let wide = matches!(cp,
         0x1100..=0x115F      // Hangul Jamo
@@ -138,6 +143,7 @@ pub fn paginate(text: &str, width: usize, lines_per_page: usize) -> Vec<Page> {
     for chunk in all_lines.chunks(lines_per_page) {
         pages.push(Page {
             lines: chunk.iter().map(|(l, _)| l.clone()).collect(),
+            line_starts: chunk.iter().map(|(_, s)| *s).collect(),
             start: chunk[0].1,
             // Filled in below: a page ends where the next one starts, so
             // no character falls outside every page. The last page runs

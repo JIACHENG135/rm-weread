@@ -63,7 +63,36 @@ Qt Quick UI -> C++ Store -> KOReader 的 LuaJIT -> weread-move/tools/*.lua
 | 正文解密 | 私有加密算法，真正的逆向工程成果 | **移植 koplugin 里那一小段纯函数**（输入密文输出明文，无状态、无 UI 依赖），一次性机械翻译成 Rust，不重新逆向 |
 | 正文分页/排版 | REweread 复用 KOReader 通用 reflow 引擎（要处理任意 EPUB/PDF） | **新写，但范围窄很多**——只需要处理微信读书自己这一种私有 chapter 格式，不需要通用排版引擎 |
 
-## 架构
+## 架构（2026-07 修订：PDF 流水线取代全屏 QML 阅读器）
+
+> 本节及下面"PDF 生成流水线与冻结规则"是当前架构。原"全屏 QML 阅读
+> 器"方案已废弃，原文和废弃理由保留在文末"已废弃：全屏 QML 阅读器"一
+> 节——那一版在真机上跑通过（阶段 4 的 commit 还在），废弃不是因为做不
+> 出来，而是因为它天花板太低：原生墨迹永远做不进去（笔迹直写
+> framebuffer、绕过 Qt 合成、还会把笔画错写进底下的真实文档——"幽灵墨
+> 迹"），而且等于在 xochitl 进程里重写一个功能弱化的阅读器。
+
+```
+weread_daemon（纯后台，触发文件驱动）
+  generate 触发 → shelf/sync 选书 → chapterInfos → 逐章:
+      拉正文分片 → content.rs 解码 → xhtml.rs 提纯文(带偏移映射)
+      → /book/underlines 拉热门划线(range→正文偏移)
+      → paginate.rs 字符网格分页
+  → layout.rs 冻结几何(layout.json) → pdfgen.rs 生成固定版式 PDF
+      (热门划线烧成下划线 + ①..⑳ 标号, 章节 outline, 嵌入 CJK 字体)
+  → xochitl_doc.rs 投递进 ~/.local/share/remarkable/xochitl/
+  ask_* 触发 → /book/readreviews → reviews.txt（评论弹窗的数据）
+  每日 → 划线集合变化 > 20% 才做"仅装饰"重生成（几何永不变）
+
+QML 补丁（xovi/weread.qmd，缩回 rm-agent 弹窗量级）
+  四指点击 → touch generate → 显示 gen.txt 进度
+  点 PDF 里的 ①标号 → 按 layout.json 命中 → touch ask_* → 弹评论
+```
+
+用户**阅读用的是 xochitl 原生 PDF 阅读器**：原生笔迹、原生延迟、笔画存
+进正确的 .rm 文件；翻页、目录、缩略图全部免费。本项目不再自己渲染正文。
+
+### 旧架构（保留作参照，代码已被替换）
 
 ```
 src/weread_client.rs（库模块，风格同 rm-agent 的 gemini.rs/xochitl.rs）
@@ -93,7 +122,106 @@ QML 阅读器（走 qt-resource-rebuilder 的 .qmd diff-patch，跟 rm-agent 的
     代价的选择，不是默认选项
 ```
 
+## PDF 生成流水线与冻结规则（当前主线）
+
+### 为什么是 PDF 而不是 EPUB
+
+生成 EPUB 交给 xochitl reflow，"字符 offset → 屏幕坐标"的映射就丢了
+（koplugin 当年绕 CREngine 的 XPointer 坑，而 xochitl 连那样的 API 都
+不给）。PDF 版式由 paginate.rs 自己排，每个字符的页码+坐标全部已知，
+微信读书 range（源 XHTML 字符偏移）经 `xhtml::Text` 的双向偏移映射即可
+对到版面上任何位置。
+
+### layout.json：几何的唯一权威
+
+`layout.rs` 生成，存两份：`~/.local/share/rm-weread/layout/<book>.json`
+（daemon 用）和 `/home/root/xovi/exthome/weread/layout.json`（QML XHR
+读，做标号命中判定）。比对话里最初的草稿更省：排版是均匀字符网格，行盒
+几何可以从行号+网格常量推导，所以只存每行的 `off/len` 和每个标号的归一
+化包围盒（0..1、左上原点——触摸事件的坐标系；rM2 和 Paper Pro 都是
+3:4，PDF 页面也生成 3:4，归一化坐标跨设备通用）。
+
+### 冻结规则（xochitl_doc.rs 强制执行）
+
+墨迹锚在页面几何上，所以：
+
+- `content_sha256`（章节纯文本 + 全部网格常量）一致 → **仅装饰刷新**：
+  原地覆盖 `<uuid>.pdf`，删缩略图，touch .metadata
+- 哈希变了、文档还没有 .rm 笔迹 → 整体覆盖
+- 哈希变了、文档已有笔迹 → **拒绝覆盖**，生成"(更新版)"新文档，旧的留
+  给用户。绝不出现"悄悄重排导致笔迹错位"
+
+pdfgen 输出是确定性的（无时间戳、无随机 ID），同输入必产生同字节——
+装饰刷新的可信度靠这个撑着。
+
+### 热门划线的呈现
+
+生成时把 `/book/underlines` 的 range 烧进版面：下划线粗细/虚实映射热度
+（≥1000 粗实线、≥100 实线、其余细虚线），每条划线尾部一个 ①..⑳ 圈号
+（每章最多 20 个，超出的只画线不给号）。评论**不**烧进版面——由 QML 弹
+窗按需拉 `/book/readreviews`（对话里定的取舍：烧进去的评论是死的、截
+断的；弹窗能看全）。
+
+### 每日刷新（阈值门控）
+
+daemon 每天对已生成的书拉一次 underlines，和 layout.json 里的 hot 集合
+算对称差/并集；**> 20% 才重新生成 PDF**（从章节缓存重建，绝不重新下
+载正文——冻结几何必须由冻结时的文本重建），否则只等下次。评论缓存独立，
+每次 generate 后清空。
+
+### IPC 协议（沿用文件触发/轮询，参数编码进文件名）
+
+QML 的 CommandExecutor 只能跑 `/bin/touch`，写不了文件内容，所以参数
+全部放进被 touch 的文件名：
+
+```
+generate                          → 重新生成书架第一本书
+ask_<chapterUid>_<range>_<nonce>  → 拉该 range 的评论
+gen.txt      seq / working|done|error / 消息
+reviews.txt  seq / ok|error / 引用原文 / 总数 / 作者<TAB>内容…
+```
+
+### 字体
+
+`assets/NotoSansSC-Regular.ttf`：Noto Sans CJK SC Regular 抽取自
+NotoSansCJK-Regular.ttc、CFF→TrueType 轮廓转换（cu2qu）、子集化到
+CJK 统一表意 + 标点 + 假名 + 圈号等区段（约 2.2 万字形，7MB），OFL 许
+可可以进仓库。pdfgen 以 CIDFontType2/Identity-H 全量嵌入（CID==GID，
+PDF 侧不需要 cmap）；按书子集化是后续体积优化，不是前提。
+
+### 待真机验证清单（2026-07-25 真机过了一轮，剩余项标注如下）
+
+1. **QML 侧拿当前 PDF 页码**（weread.qmd 里 `weReadCurrentPage()` 的
+   TODO）：dump documentview 的 QML 找 SceneView/父链上的页码和缩放
+   transform 属性。找到之前标号点击禁用，生成/阅读不受影响
+   ——**唯一剩下的设计级未知数**
+2. ~~xochitl 对换 .pdf 的反应~~ **部分验证**（Paper Pro 3.27.3）：
+   重启 xochitl 后新文档正常出现、worker 正常渲染缩略图、无报错；
+   装饰刷新的原地覆盖（同 uuid 换 PDF）在文档未打开时执行成功。
+   还没验证的：不重启能否出现新文档；文档打开着的时候换 PDF 会怎样
+   （daemon 侧后续可以加"检查 lastOpened 再换"的保守逻辑）
+3. ~~两个端点的真实响应形状~~ **已验证并回填**（真实抓包进了单测）：
+   - `/book/underlines`：顶层 `underlines` 数组，`count` 常为 0、热度
+     在 `score`（0..1 浮点）——解析取 `max(count, score*1000)`
+   - `/book/readreviews`：请求必须带 `reviews` 数组且 `maxIdx: 0`
+     （非 0 时 `pageReviews` 返回空——文档里没写，实测发现）；响应在
+     `reviews[0].pageReviews[].review.{content, abstract, author.name}`
+   - 真机端到端：40 章书生成 300 页 PDF/4.9MB、840 处划线、322 个标
+     号；ask_* 触发返回了真实的 1184 条想法列表
+4. 图片：章节里的图还没进 PDF（chapterInfos 的 tar 资源）。**必须在给
+   某本书首次生成前做对**，事后补会改几何、作废该书已有笔迹
+5. 阅读进度不再回传微信读书（只读的必然结果）——README 要写清楚，免得
+   被当 bug 报
+6. （运维教训，真机踩到）daemon 的 stdout 不能接在会断的 tty/管道上：
+   ssh 断开后管道缓冲写满，`println!` 阻塞把整个 daemon 卡死。已改为
+   systemd 服务（journal 接管输出），service 文件不再依赖 xovi/xochitl
+
 ## 为什么走 patch 而不是 AppLoad
+
+> 2026-07 修订后本节的天平变了：patch 侧的代价清单大幅缩水（QML 从全
+> 屏阅读器缩回小弹窗，代价 1 的风险敞口回到 rm-agent 翻译卡片的量级，
+> 代价 2 的全屏事件捕获整个不需要了，代价 3 的入口只剩"四指触发生成"），
+> 结论反而更稳固：更没有理由为一个小弹窗引入 AppLoad 了。原文保留：
 
 XOVI 里有两套不同的机制：qt-resource-rebuilder 的 .qmd diff-patch（往
 xochitl 已有界面里注入东西），和 AppLoad（装一个有自己图标、自己进程、
@@ -301,17 +429,19 @@ koplugin 展示"点击划线弹出想法"的方式很巧妙：下载时把想法
    真实请求发的是带 `.0` 后缀的字符串（如 `"1522756.0"`），不是纯整数——
    用整数运算算出数值后手动拼 `.0` 后缀实现的，没有经过 `f64`（Rust 的
    `f64` Display 对整数值不会自动带 `.0`，直接用会漏掉这个后缀）。
-4. 最小分页渲染 + QML 阅读器补丁，先跑通"打开一本书翻页"
-   ← **当前阶段**。走 .qmd diff-patch 而不是 AppLoad（决策和代价见上面
-   "为什么走 patch 而不是 AppLoad"）。子步骤：
-   - Rust 侧：把解码出的 XHTML 转成"当前页文本"（窄范围分页，只服务微信
-     读书这一种 chapter 格式），`weread_daemon` 通过结果文件喂给 QML
-   - QML 侧：全屏 Item（默认 visible:false）+ 高 z-order 事件捕获层 +
-     翻页手势
-   - 入口：先用最省事的方式（角落多指手势，复用 rm-agent 已验证的写法），
-     不做主屏图标
-   - 每次改完必须先 `xovi/debug` 前台验证再持久化——这个项目补丁体量大，
-     跳过这步的后果是整个 xochitl 崩
+4. ~~最小分页渲染 + QML 阅读器补丁~~ → **改道：PDF 生成流水线**
+   ← **当前阶段**（方案见上面"PDF 生成流水线与冻结规则"；改道理由见
+   "已废弃：全屏 QML 阅读器"）。已实现，待真机验证：
+   - `layout.rs`（冻结几何 + 标号命中）、`pdfgen.rs`（手写 PDF，字符
+     网格 + CJK 字体嵌入 + 下划线/标号/outline）、`underlines.rs`
+     （热门划线/评论 API + range→正文偏移映射）、`xochitl_doc.rs`
+     （投递 + 冻结规则）、`pipeline.rs`（端到端 + 阈值刷新）
+   - `weread_daemon` 改造成 generate/ask/每日刷新三件事
+   - `weread.qmd` 缩回小弹窗（四指生成 + 点标号看评论）
+   - `weread_pdf` CLI：桌面端对真实账号跑整条流水线
+   - 待验证清单见"PDF 生成流水线与冻结规则"末尾——其中 QML 拿当前页码
+     是唯一的设计级未知数，其余是接口形状/缓存行为级别
+   - `xovi/debug` 前台验证的纪律不变（弹窗虽小，仍在 xochitl 进程里）
 5. **设备原生登录 UI**——阶段 1 现在的登录方式（CLI 打印链接，人在另一台
    电脑上用 `qrencode` 生成图片看）只是验证协议用的脚手架，**不是最终产
    品该有的样子**：如果手头只有 rmb、没有电脑，这套完全没法用。真正要做
@@ -328,6 +458,36 @@ koplugin 展示"点击划线弹出想法"的方式很巧妙：下载时把想法
      字验证码用一个简单的 QML 数字键盘（点数字）就够了，没必要上 OCR
    - 这一步是可用性的硬前提（没有它，设备离开电脑就没法首次登录），不
      是锦上添花，得跟阶段 4 的 QML 补丁一起做，不能拖到最后
-6. 批注（复用现有手势链路——到这一步再定手势追踪代码怎么在两个仓库间
-   共享）
-7. 热门划线/评论（按需拉取 + REweread 的防御性节流策略）
+6. ~~批注（复用现有手势链路）~~ → 改道后**只读**：不做自由手写批注的
+   识别/回写（见"已废弃"一节——笔画意图判别是最容易做砸、最容易惹恼用
+   户的一环；原生笔迹现在直接存在 PDF 文档里，本来就是批注）。回写微
+   信读书划线保持"可选 v2"不启动
+7. 热门划线/评论 → 已并入阶段 4 的流水线（划线烧进 PDF，评论走弹窗按
+   需拉取 + REweread 的防御性节流策略）
+
+## 已废弃：全屏 QML 阅读器（2026-07）
+
+阶段 4 原本的形态：weread.qmd 往 SceneViewGestures.qml 注入一个
+`z: 2000` 的全屏 Rectangle + 铺满的 MouseArea，daemon 逐页喂已换行文
+本。真机跑通过翻页。废弃理由，按分量排：
+
+1. **原生墨迹做不进去，而且比"显示不出来"更糟**。xochitl 的书写引擎拿
+   到 Wacom 事件后直写 framebuffer（EPDC A2/DU 局部刷新），不经过 QML
+   事件分发、不参与 Qt 场景图合成——`z: 2000` 对它完全无效。实际后果是
+   **幽灵墨迹**：笔迹视觉上出现在阅读器上层（直写 fb），却被记进底下
+   那个真实打开着的文档；QML 重绘擦掉屏上笔迹，关掉阅读器后笔迹留在错
+   误的文档里——污染用户真实的笔记文件。要根治只有 EVIOCGRAB 独占笔设
+   备 + 自己实现整套笔画渲染（把 rmkit 重写一遍），工程量和"跑在
+   xochitl 进程内"的风险不成比例
+2. **本质是在 xochitl 进程里重写一个功能弱化的阅读器**：翻页闪全屏
+   GC16、同步 XHR 卡 UI 线程、无缩略图/目录/进度，全都要自己补
+3. 全屏事件捕获只做了触摸没做笔（MouseArea 接不到笔事件），就算补上
+   grab 也回到第 1 条的渲染问题
+
+改成"生成 PDF 交给 xochitl 原生阅读器"后，这三条整体消失——墨迹问题不
+是被绕开，是**不存在了**：用户用的就是原生书写路径。换来的新约束（版
+式冻结、只读、进度不回传）见"PDF 生成流水线与冻结规则"。
+
+ToS 注意：落地 PDF 意味着在设备本地生成付费书的完整副本，比"临时全屏
+显示"的分量重。仅供个人非商用；章节缓存和生成的 PDF 都只存在用户自己
+的设备上，不上传、不分发。

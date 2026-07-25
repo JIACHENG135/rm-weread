@@ -59,6 +59,38 @@ impl Text {
     pub fn char_len(&self) -> usize {
         self.text.chars().count()
     }
+
+    /// The inverse of `source_offset`: maps a character offset in the
+    /// *original XHTML* to the offset of the first retained character at
+    /// or after it in the plain text. This is what turns WeRead's
+    /// `range` values ("345-361", rune indices into the raw chapter
+    /// HTML — see module docs) into offsets our own layout understands.
+    /// Offsets that land inside dropped content (tags, collapsed
+    /// whitespace) snap forward to the next retained character, which is
+    /// the right behaviour for a range start; a range *end* should be
+    /// mapped from its last included character instead of one-past-end
+    /// so it can't leak past intervening markup.
+    pub fn out_offset_for_source(&self, src_offset: usize) -> Option<usize> {
+        if self.segments.is_empty() {
+            return None;
+        }
+        // First segment whose end lies beyond src_offset. Segments are
+        // built in source order, so both out_* and src_* are ascending.
+        let idx = self
+            .segments
+            .partition_point(|s| s.src_start + s.src_len <= src_offset);
+        let seg = self.segments.get(idx)?;
+        if src_offset <= seg.src_start {
+            return Some(seg.out_start); // in dropped content: snap forward
+        }
+        let delta = src_offset - seg.src_start;
+        // Inside a multi-char entity the whole entity is one output char.
+        if seg.src_len == seg.out_len {
+            Some(seg.out_start + delta.min(seg.out_len.saturating_sub(1)))
+        } else {
+            Some(seg.out_start)
+        }
+    }
 }
 
 /// Elements whose *content* is dropped entirely, not just their tags.
@@ -259,6 +291,38 @@ mod tests {
         assert_eq!(t.source_offset(3), Some(12)); // 'c'
         assert_eq!(t.source_offset(4), Some(13)); // '&' — the entity's start
         assert_eq!(t.source_offset(5), Some(18)); // 'd', after "&amp;"
+    }
+
+    #[test]
+    fn reverse_maps_source_offsets_to_text() {
+        let xhtml = "<p>ab</p><p>c&amp;d</p>";
+        let t = to_text(xhtml);
+        assert_eq!(t.text, "ab\nc&d");
+        assert_eq!(t.out_offset_for_source(3), Some(0)); // 'a'
+        assert_eq!(t.out_offset_for_source(4), Some(1)); // 'b'
+        assert_eq!(t.out_offset_for_source(12), Some(3)); // 'c'
+        assert_eq!(t.out_offset_for_source(13), Some(4)); // entity start
+        assert_eq!(t.out_offset_for_source(18), Some(5)); // 'd'
+        // Inside a tag: snaps forward to the next retained character.
+        assert_eq!(t.out_offset_for_source(0), Some(0));
+        assert_eq!(t.out_offset_for_source(6), Some(3));
+        // Past the end of everything retained.
+        assert_eq!(t.out_offset_for_source(999), None);
+    }
+
+    #[test]
+    fn reverse_map_roundtrips_through_source_offset() {
+        let t = to_text("<p>第一段</p><p>second &amp; more</p>");
+        for (out, c) in t.text.chars().enumerate() {
+            if c.is_whitespace() {
+                // Synthetic characters (paragraph breaks, collapsed
+                // spaces) have no source position of their own; the
+                // roundtrip guarantee is only for retained content.
+                continue;
+            }
+            let src = t.source_offset(out).unwrap();
+            assert_eq!(t.out_offset_for_source(src), Some(out), "offset {out} ({c:?})");
+        }
     }
 
     #[test]

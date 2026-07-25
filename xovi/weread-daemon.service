@@ -1,7 +1,9 @@
 [Unit]
-Description=weread_daemon (fullscreen WeRead reader backend for the XOVI QML patch)
-After=xovi-start.service xochitl.service
-Requires=xovi-start.service xochitl.service
+Description=weread_daemon (WeRead -> PDF pipeline + review-popup backend)
+# No hard dependency on xochitl/xovi any more: the pipeline only writes
+# files. Network is what generation actually needs.
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple

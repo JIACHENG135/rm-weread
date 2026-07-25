@@ -3,53 +3,55 @@ IMPORT net.asivery.CommandExecutor 1.0
     TRAVERSE TouchArea
         LOCATE BEFORE ALL
     INSERT {
-        // Fullscreen WeRead reader, patched into xochitl's existing QML
-        // tree via qt-resource-rebuilder (see docs/design.md §"为什么走
-        // patch 而不是 AppLoad"). Same mechanism as rm-agent's
-        // three_finger_translate.qmd — a normally-hidden Item plus
-        // file-based IPC with a native daemon — just scaled up from a
-        // small popup to a fullscreen surface.
+        // WeRead hot-review popup — the ONLY QML this project injects
+        // now. The fullscreen QML reader that used to live here is
+        // deprecated (docs/design.md §"已废弃：全屏 QML 阅读器"):
+        // reading happens in xochitl's own PDF reader on documents the
+        // daemon generates, so this patch shrank from a fullscreen
+        // surface back down to rm-agent's proven popup size.
         //
-        // NOTE: every comment in this file has to live inside this
-        // INSERT block. The .qmd grammar only accepts AFFECT / SLOT /
-        // VERSION / TEMPLATE at the top level, so a `//` line before
-        // AFFECT makes qmldiff reject the whole file ("expected AFFECT
-        // ... got Identifier(\"//\")") — confirmed on device. It fails
-        // safely (the patch just doesn't load) but silently, so the
-        // reader would simply never appear.
+        // NOTE: every comment must live inside this INSERT block — the
+        // .qmd grammar rejects top-level `//` lines (confirmed on
+        // device; fails safe but silent).
         //
-        // A SEPARATE .qmd from rm-agent's, deliberately:
-        // qt-resource-rebuilder iterates the directory and loads every
-        // .qmd it finds (also confirmed on device — both files show up
-        // as "Loading file ..."), so the two projects' patches coexist
-        // without either repo knowing about the other's file, and
-        // without repeating the "two copies of one .qmd drift apart"
-        // incident.
+        // This QML runs INSIDE xochitl's process. Always validate with
+        // `xovi/debug` in the foreground before making it persistent.
         //
-        // This QML runs INSIDE xochitl's process. A mistake here doesn't
-        // just break the reader, it can crash xochitl into a reboot
-        // loop — always validate with `xovi/debug` in the foreground
-        // before making it persistent.
+        // Two interactions:
+        //  1. Four-finger tap -> touch `generate`, show progress from
+        //     gen.txt while the daemon builds/refreshes the PDF.
+        //  2. Tap on a circled marker (①..⑳ burned into the PDF) ->
+        //     hit-test against layout.json's marker boxes, touch
+        //     `ask_<chapterUid>_<range>_<nonce>`, poll reviews.txt,
+        //     show the popup. Taps that miss every marker pass through
+        //     untouched (mouse.accepted = false), so page turns behave
+        //     exactly as before on pages without markers.
         //
-        // Rust does the line wrapping (paginate.rs); this file renders
-        // the already-wrapped lines verbatim and must never re-wrap
-        // them, or the character offsets annotations depend on stop
-        // matching what's on screen.
+        // ── ON-DEVICE TODO (the one open question of this design) ──
+        // Marker hit-testing needs the CURRENT PDF PAGE (0-based) and
+        // ideally the view transform (zoom/pan). Both almost certainly
+        // exist somewhere on this documentview QML context; the names
+        // must be found on a real device by dumping the documentview/
+        // QML via qt-resource-rebuilder and reading what SceneView /
+        // its parents expose (or logging parent-chain property names
+        // from here). Until then `weReadCurrentPage()` returns -1 and
+        // marker taps are DISABLED — reading and generation work, the
+        // popup doesn't fire. Wire it up by replacing the body of
+        // weReadCurrentPage() below. v1 also assumes an unzoomed page
+        // (3:4 PDF fills the 3:4 screen 1:1); zoom support needs the
+        // transform from the same dump.
 
-        // Four fingers, so it can't be confused with rm-agent's
-        // three-finger translate gesture patched into this same file.
         TouchAreaClickFilter {
-            id: weReadOpenFilter
+            id: weReadGenerateFilter
             palmAreaThreshold: touchArea.tapPalmThreshold
             enabled: !touchArea.panAndZoomOnly
             fingers: 4
             onClick: {
-                weReadReader.visible = true;
-                weReadReader.statusText = "正在打开…";
-                weReadReader.bodyText = "";
-                weReadReader.lastSeq = weReadReader.readSeq();
-                weReadCmd.executeCommand("/bin/touch", ["/home/root/xovi/exthome/weread/open"]);
-                weReadPoller.start();
+                weReadStatus.lastSeq = weReadIpc.readSeq("gen.txt");
+                weReadStatus.message = "正在生成…";
+                weReadStatus.visible = true;
+                weReadCmd.executeCommand("/bin/touch", ["/home/root/xovi/exthome/weread/generate"]);
+                weReadGenPoller.start();
             }
         }
 
@@ -62,28 +64,15 @@ IMPORT net.asivery.CommandExecutor 1.0
             source: "file:///home/root/xovi/exthome/weread/NotoSansSC.ttf"
         }
 
-        Rectangle {
-            id: weReadReader
+        Item {
+            id: weReadIpc
             visible: false
-            // Above rm-agent's translate popup (z: 1000) so the two can
-            // never fight over the screen.
-            z: 2000
-            color: "white"
-            width: touchArea.width
-            height: touchArea.height
-            x: 0
-            y: 0
+            property var layoutData: null
 
-            property int lastSeq: 0
-            property string statusText: ""
-            property string titleText: ""
-            property string pageInfo: ""
-            property string bodyText: ""
-
-            function readResultFile() {
+            function readFile(name) {
                 var xhr = new XMLHttpRequest();
                 try {
-                    xhr.open("GET", "file:///home/root/xovi/exthome/weread/page.txt", false);
+                    xhr.open("GET", "file:///home/root/xovi/exthome/weread/" + name, false);
                     xhr.send();
                     return xhr.responseText || "";
                 } catch (e) {
@@ -91,124 +80,238 @@ IMPORT net.asivery.CommandExecutor 1.0
                 }
             }
 
-            function readSeq() {
-                var raw = readResultFile();
-                var n = parseInt(raw.split("\n")[0]);
+            function readSeq(name) {
+                var n = parseInt(readFile(name).split("\n")[0]);
                 return isNaN(n) ? 0 : n;
             }
 
-            // Swallows every touch inside the reader so nothing reaches
-            // the document underneath — without this, a page-turn tap
-            // would also flip the real document behind us.
-            MouseArea {
-                id: weReadCapture
-                anchors.fill: parent
-                onClicked: (mouse) => {
-                    if (mouse.y < weReadReader.height * 0.12) {
-                        // Top strip closes.
-                        weReadReader.visible = false;
-                        weReadPoller.stop();
-                        weReadCmd.executeCommand("/bin/touch", ["/home/root/xovi/exthome/weread/close"]);
-                        return;
-                    }
-                    var file = mouse.x < weReadReader.width * 0.35
-                        ? "/home/root/xovi/exthome/weread/prev"
-                        : "/home/root/xovi/exthome/weread/next";
-                    weReadReader.lastSeq = weReadReader.readSeq();
-                    weReadCmd.executeCommand("/bin/touch", [file]);
-                    weReadPoller.start();
+            function loadLayout() {
+                var raw = readFile("layout.json");
+                if (!raw) { layoutData = null; return; }
+                try { layoutData = JSON.parse(raw); } catch (e) { layoutData = null; }
+            }
+
+            // ON-DEVICE TODO (see header comment): return the 0-based
+            // page of the PDF currently on screen, or -1 when unknown.
+            function currentPage() {
+                return -1;
+            }
+
+            // Nearest marker on `page` whose expanded box contains the
+            // normalized tap point, or null.
+            function hitMarker(page, nx, ny) {
+                if (!layoutData || !layoutData.markers) return null;
+                var sx = 44.0 / 702.0 / 2.0, sy = 44.0 / 936.0 / 2.0;
+                var best = null, bestDist = 1e9;
+                for (var i = 0; i < layoutData.markers.length; i++) {
+                    var m = layoutData.markers[i];
+                    if (m.page !== page) continue;
+                    if (nx < m.x0 - sx || nx > m.x1 + sx || ny < m.y0 - sy || ny > m.y1 + sy) continue;
+                    var d = Math.abs(nx - (m.x0 + m.x1) / 2) + Math.abs(ny - (m.y0 + m.y1) / 2);
+                    if (d < bestDist) { bestDist = d; best = m; }
                 }
+                return best;
             }
+        }
+
+        MouseArea {
+            id: weReadMarkerTap
+            anchors.fill: parent
+            z: 900
+            propagateComposedEvents: true
+            visible: !weReadPopup.visible
+            onPressed: (mouse) => {
+                var page = weReadIpc.currentPage();
+                if (page < 0) { mouse.accepted = false; return; }
+                if (!weReadIpc.layoutData) weReadIpc.loadLayout();
+                var m = weReadIpc.hitMarker(page, mouse.x / width, mouse.y / height);
+                if (!m) { mouse.accepted = false; return; }
+                mouse.accepted = true;
+                weReadPopup.quote = "";
+                weReadPopup.reviewsText = "正在加载评论…";
+                weReadPopup.visible = true;
+                weReadPopup.lastSeq = weReadIpc.readSeq("reviews.txt");
+                weReadCmd.executeCommand("/bin/touch", [
+                    "/home/root/xovi/exthome/weread/ask_" + m.chapter_uid + "_" + m.range + "_" + Date.now()
+                ]);
+                weReadReviewPoller.start();
+            }
+        }
+
+        Rectangle {
+            id: weReadStatus
+            visible: false
+            z: 1500
+            color: "white"
+            border.color: "black"
+            border.width: 2
+            radius: 6
+            width: Math.min(parent.width * 0.7, 620)
+            height: weReadStatusText.implicitHeight + 40
+            anchors.horizontalCenter: parent.horizontalCenter
+            y: 24
+            property int lastSeq: 0
+            property string message: ""
 
             Text {
-                id: weReadTitle
-                anchors.top: parent.top
-                anchors.topMargin: 40
-                anchors.horizontalCenter: parent.horizontalCenter
-                font.family: weReadFont.name
-                font.pixelSize: 26
-                color: "#606060"
-                text: weReadReader.titleText
-            }
-
-            Text {
-                id: weReadBody
-                anchors.top: parent.top
-                anchors.topMargin: 110
-                anchors.left: parent.left
-                anchors.leftMargin: 60
-                anchors.right: parent.right
-                anchors.rightMargin: 60
-                font.family: weReadFont.name
-                font.pixelSize: 34
-                lineHeight: 1.45
-                color: "black"
-                // Rust already wrapped these lines to fit; re-wrapping
-                // here would desync the on-screen text from the
-                // character offsets annotations rely on.
-                wrapMode: Text.NoWrap
-                textFormat: Text.PlainText
-                text: weReadReader.bodyText
-            }
-
-            Text {
-                id: weReadStatus
+                id: weReadStatusText
                 anchors.centerIn: parent
+                width: parent.width - 40
+                wrapMode: Text.Wrap
+                horizontalAlignment: Text.AlignHCenter
                 font.family: weReadFont.name
-                font.pixelSize: 30
-                color: "#808080"
-                visible: weReadReader.statusText.length > 0
-                text: weReadReader.statusText
+                font.pixelSize: 24
+                color: "black"
+                text: weReadStatus.message
             }
 
-            Text {
-                id: weReadFooter
-                anchors.bottom: parent.bottom
-                anchors.bottomMargin: 36
-                anchors.horizontalCenter: parent.horizontalCenter
-                font.family: weReadFont.name
-                font.pixelSize: 22
-                color: "#909090"
-                text: weReadReader.pageInfo
+            MouseArea {
+                anchors.fill: parent
+                onClicked: { weReadStatus.visible = false; weReadGenPoller.stop(); }
             }
         }
 
         Timer {
-            id: weReadPoller
+            id: weReadGenPoller
+            interval: 500
+            repeat: true
+            property int elapsedMs: 0
+            onTriggered: {
+                elapsedMs += interval;
+                var raw = weReadIpc.readFile("gen.txt");
+                var lines = raw.split("\n");
+                var seq = parseInt(lines[0]);
+                if (!isNaN(seq) && seq > weReadStatus.lastSeq) {
+                    weReadStatus.lastSeq = seq;
+                    var status = lines.length > 1 ? lines[1] : "";
+                    weReadStatus.message = lines.length > 2 ? lines.slice(2).join(" ") : "";
+                    if (status === "working") { elapsedMs = 0; return; }
+                    weReadIpc.loadLayout();
+                    elapsedMs = 0;
+                    stop();
+                    weReadStatusHide.restart();
+                    return;
+                }
+                // A whole book takes a while; only give up after 30 min.
+                if (elapsedMs > 1800000) {
+                    weReadStatus.message = "(超时，看看 daemon 日志)";
+                    elapsedMs = 0;
+                    stop();
+                }
+            }
+        }
+
+        Timer {
+            id: weReadStatusHide
+            interval: 8000
+            onTriggered: weReadStatus.visible = false
+        }
+
+        Rectangle {
+            id: weReadPopup
+            visible: false
+            z: 1500
+            color: "white"
+            border.color: "black"
+            border.width: 2
+            radius: 8
+            width: Math.min(parent.width * 0.8, 900)
+            height: Math.min(parent.height * 0.6, 1100)
+            anchors.centerIn: parent
+            property int lastSeq: 0
+            property string quote: ""
+            property string reviewsText: ""
+
+            Text {
+                id: weReadQuote
+                anchors.top: parent.top
+                anchors.topMargin: 24
+                anchors.left: parent.left
+                anchors.leftMargin: 28
+                anchors.right: parent.right
+                anchors.rightMargin: 28
+                wrapMode: Text.Wrap
+                maximumLineCount: 3
+                elide: Text.ElideRight
+                font.family: weReadFont.name
+                font.pixelSize: 26
+                font.bold: true
+                color: "black"
+                visible: text.length > 0
+                text: weReadPopup.quote
+            }
+
+            Flickable {
+                anchors.top: weReadQuote.visible ? weReadQuote.bottom : parent.top
+                anchors.topMargin: 20
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: 24
+                anchors.left: parent.left
+                anchors.leftMargin: 28
+                anchors.right: parent.right
+                anchors.rightMargin: 28
+                contentHeight: weReadReviews.implicitHeight
+                clip: true
+
+                Text {
+                    id: weReadReviews
+                    width: parent.width
+                    wrapMode: Text.Wrap
+                    font.family: weReadFont.name
+                    font.pixelSize: 24
+                    lineHeight: 1.3
+                    color: "black"
+                    textFormat: Text.PlainText
+                    text: weReadPopup.reviewsText
+                }
+            }
+        }
+
+        MouseArea {
+            id: weReadPopupDismiss
+            anchors.fill: parent
+            z: 1400
+            visible: weReadPopup.visible
+            onClicked: {
+                weReadPopup.visible = false;
+                weReadReviewPoller.stop();
+            }
+        }
+
+        Timer {
+            id: weReadReviewPoller
             interval: 300
             repeat: true
             property int elapsedMs: 0
             onTriggered: {
                 elapsedMs += interval;
-                var raw = weReadReader.readResultFile();
+                var raw = weReadIpc.readFile("reviews.txt");
                 var lines = raw.split("\n");
                 var seq = parseInt(lines[0]);
-                if (!isNaN(seq) && seq > weReadReader.lastSeq) {
-                    weReadReader.lastSeq = seq;
+                if (!isNaN(seq) && seq > weReadPopup.lastSeq) {
+                    weReadPopup.lastSeq = seq;
                     var status = lines.length > 1 ? lines[1] : "";
-                    weReadReader.titleText = lines.length > 2 ? lines[2] : "";
-                    weReadReader.pageInfo = lines.length > 3 ? lines[3] : "";
-                    if (status === "page") {
-                        weReadReader.statusText = "";
-                        weReadReader.bodyText = lines.length > 4 ? lines.slice(4).join("\n") : "";
+                    if (status === "ok") {
+                        weReadPopup.quote = lines.length > 2 ? lines[2] : "";
+                        var total = lines.length > 3 ? lines[3] : "0";
+                        var body = "";
+                        for (var i = 4; i < lines.length; i++) {
+                            if (!lines[i]) continue;
+                            var tab = lines[i].indexOf("\t");
+                            var author = tab >= 0 ? lines[i].substring(0, tab) : "";
+                            var content = tab >= 0 ? lines[i].substring(tab + 1) : lines[i];
+                            body += (body ? "\n\n" : "") + author + "：" + content;
+                        }
+                        weReadPopup.reviewsText = (total + " 条想法\n\n") + (body || "（还没有想法）");
                     } else {
-                        weReadReader.statusText = lines.length > 4 ? lines.slice(4).join("\n") : "(出错)";
-                        weReadReader.bodyText = "";
-                    }
-                    // "loading" is a progress note, not an answer — the
-                    // daemon will write again when the fetch finishes.
-                    // Stopping here is what previously left the reader
-                    // stuck on "正在打开…" forever.
-                    if (status === "loading") {
-                        elapsedMs = 0;
-                        return;
+                        weReadPopup.reviewsText = lines.length > 2 ? lines.slice(2).join(" ") : "(出错)";
                     }
                     elapsedMs = 0;
                     stop();
                     return;
                 }
-                if (elapsedMs > 60000) {
-                    weReadReader.statusText = "(超时，请重试)";
+                if (elapsedMs > 20000) {
+                    weReadPopup.reviewsText = "(超时，请重试)";
                     elapsedMs = 0;
                     stop();
                 }
