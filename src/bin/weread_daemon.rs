@@ -101,6 +101,40 @@ fn show_error(message: &str) {
     }
 }
 
+/// A progress note, distinct from `error` so the QML poller knows to keep
+/// waiting instead of treating it as the final answer (it did exactly
+/// that once, leaving the reader stuck on "正在打开…").
+fn show_loading(message: &str) {
+    if let Err(e) = write_result("loading", "", "", message) {
+        eprintln!("weread: failed to write loading result: {e}");
+    }
+}
+
+/// Retries an operation that hits the network. Flaky DNS on shared/cafe
+/// Wi-Fi ("failed to lookup address information: Try again") has broken
+/// real runs here more than once, and one retry a couple of seconds
+/// later has been enough every time.
+fn with_retry<T>(
+    what: &str,
+    mut op: impl FnMut() -> Result<T, Box<dyn std::error::Error>>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    const ATTEMPTS: usize = 3;
+    let mut last: Option<Box<dyn std::error::Error>> = None;
+    for attempt in 1..=ATTEMPTS {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                eprintln!("weread: {what} attempt {attempt}/{ATTEMPTS} failed: {e}");
+                last = Some(e);
+                if attempt < ATTEMPTS {
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| "unknown error".into()))
+}
+
 /// Fetches + paginates one chapter. `at_end` starts on the last page,
 /// so paging backwards into a chapter lands where the reader expects.
 fn load_chapter(
@@ -171,8 +205,8 @@ fn main() {
         }
 
         if take_trigger("open") {
-            show_error("正在打开…");
-            match open_book(&agent, &mut sess) {
+            show_loading("正在打开…");
+            match with_retry("open", || open_book(&agent, &mut sess)) {
                 Ok((b, c)) => {
                     book = Some(b);
                     show(&c);
@@ -207,8 +241,10 @@ fn main() {
                 if next_chapter < 0 || next_chapter as usize >= b.chapters.len() {
                     show(c); // already at the very start/end of the book
                 } else {
-                    show_error("正在加载…");
-                    match load_chapter(&agent, &mut sess, b, next_chapter as usize, step < 0) {
+                    show_loading("正在加载…");
+                    match with_retry("chapter load", || {
+                        load_chapter(&agent, &mut sess, b, next_chapter as usize, step < 0)
+                    }) {
                         Ok(loaded) => {
                             show(&loaded);
                             *c = loaded;

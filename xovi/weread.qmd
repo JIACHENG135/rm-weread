@@ -195,11 +195,19 @@ IMPORT net.asivery.CommandExecutor 1.0
                         weReadReader.statusText = lines.length > 4 ? lines.slice(4).join("\n") : "(出错)";
                         weReadReader.bodyText = "";
                     }
+                    // "loading" is a progress note, not an answer — the
+                    // daemon will write again when the fetch finishes.
+                    // Stopping here is what previously left the reader
+                    // stuck on "正在打开…" forever.
+                    if (status === "loading") {
+                        elapsedMs = 0;
+                        return;
+                    }
                     elapsedMs = 0;
                     stop();
                     return;
                 }
-                if (elapsedMs > 30000) {
+                if (elapsedMs > 60000) {
                     weReadReader.statusText = "(超时，请重试)";
                     elapsedMs = 0;
                     stop();
