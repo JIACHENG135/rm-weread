@@ -231,6 +231,30 @@ fn ensure_qml_font(paths: &Paths) {
     }
 }
 
+/// The dash textures the QML overlay tiles to draw underlines.
+///
+/// Three files rather than one tinted at runtime: e-ink dithers
+/// translucency into visible speckle, so each heat tier needs its grey
+/// baked in. Periods and greys mirror `pdfgen::underline_style`, so a
+/// book with underlines burned into the page and one drawn live look
+/// the same.
+fn ensure_dash_textures(paths: &Paths) {
+    const DASHES: [(&str, &[u8]); 3] = [
+        ("dash-hot.png", include_bytes!("../../assets/dash-hot.png")),
+        ("dash-warm.png", include_bytes!("../../assets/dash-warm.png")),
+        ("dash-cool.png", include_bytes!("../../assets/dash-cool.png")),
+    ];
+    for (name, bytes) in DASHES {
+        let dest = paths.exthome.join(name);
+        if fs::metadata(&dest).map(|m| m.len() as usize == bytes.len()).unwrap_or(false) {
+            continue;
+        }
+        if let Err(e) = fs::write(&dest, bytes) {
+            eprintln!("weread: could not install {name}: {e}");
+        }
+    }
+}
+
 /// Points fontconfig at that font, so xochitl's *own* library view can
 /// render the Chinese document names this project creates.
 ///
@@ -437,6 +461,7 @@ fn main() {
     // regenerated with different geometry.
     let _ = fs::remove_dir_all(paths.exthome.join("hot"));
     ensure_qml_font(&paths);
+    ensure_dash_textures(&paths);
     ensure_fontconfig(&paths);
     ensure_shelf_card(&paths);
     if !exthome().join("gen.txt").exists() {

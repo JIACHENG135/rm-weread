@@ -724,10 +724,11 @@ IMPORT net.asivery.CommandExecutor 1.0
 
             property var rules: []
 
-            // Verification offset: drawn 10px below the printed rule so
-            // the two can be told apart. Zero once the underlines stop
-            // being burned into the PDF.
-            readonly property int probeOffset: 10
+            // Sits on the rule, not below it. A 10px offset was used
+            // while proving the geometry against underlines burned into
+            // the page — the two had to be distinguishable to tell
+            // "aligned" apart from "never drew".
+            readonly property int probeOffset: 0
 
             onCurPageChanged: rebuild()
             Component.onCompleted: rebuild()
@@ -749,10 +750,17 @@ IMPORT net.asivery.CommandExecutor 1.0
                     // box; a tap box is the line box plus 30% slop
                     // below, so the line height is (y1 - y0) / 1.3.
                     var lineH = (t.y1 - t.y0) / 1.3;
+                    // Heat picks the texture, mirroring the tiers
+                    // pdfgen burns into older books.
+                    var tex = t.count >= 1000 ? "dash-hot.png"
+                            : t.count >= 100 ? "dash-warm.png"
+                            : "dash-cool.png";
                     out.push({
                         rx: r.x + t.x0 * r.width,
                         ry: r.y + (t.y0 + 0.78 * lineH + 3.0 / 936.0) * r.height + probeOffset,
-                        rw: (t.x1 - t.x0) * r.width
+                        rw: (t.x1 - t.x0) * r.width,
+                        rh: t.count >= 1000 ? 3 : 2,
+                        tex: tex
                     });
                 }
                 rules = out;
@@ -761,12 +769,17 @@ IMPORT net.asivery.CommandExecutor 1.0
 
             Repeater {
                 model: weReadOverlay.rules
-                delegate: Rectangle {
+                // One tiled Image per run. A Repeater of little
+                // Rectangles would need ~50 of them for a single line
+                // at this dash period, and thousands on a busy page.
+                delegate: Image {
                     x: modelData.rx
                     y: modelData.ry
                     width: modelData.rw
-                    height: 3
-                    color: "black"
+                    height: modelData.rh
+                    fillMode: Image.TileHorizontally
+                    smooth: false
+                    source: "file:///home/root/xovi/exthome/weread/" + modelData.tex
                 }
             }
         }
