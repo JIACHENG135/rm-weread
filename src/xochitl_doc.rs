@@ -172,6 +172,65 @@ fn ensure_folder(xochitl_dir: &Path, reg: &mut Registry) -> std::io::Result<Stri
     Ok(uuid)
 }
 
+/// A live document with this exact name inside `parent`, if any.
+pub fn find_document_named(xochitl_dir: &Path, name: &str, parent: &str) -> Option<String> {
+    let mut found: Vec<String> = fs::read_dir(xochitl_dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().extension().map(|x| x == "metadata").unwrap_or(false))
+        .filter_map(|e| {
+            let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(e.path()).ok()?).ok()?;
+            let hit = v.get("type").and_then(|t| t.as_str()) == Some("DocumentType")
+                && v.get("visibleName").and_then(|n| n.as_str()) == Some(name)
+                && v.get("parent").and_then(|p| p.as_str()) == Some(parent)
+                && v.get("deleted").and_then(|d| d.as_bool()) != Some(true);
+            hit.then(|| e.path().file_stem()?.to_str().map(str::to_owned))?
+        })
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
+/// A live document in `parent` that looks like this book: named exactly
+/// the title, or the versioned "书名 (更新版)" form.
+///
+/// This is how a device recognises a book that arrived by reMarkable's
+/// *own* cloud sync rather than being generated here. Sync replicates
+/// the whole 微信读书 folder between a reader's tablets, so the second
+/// one sees the documents but has nothing in its registry — and would
+/// happily generate a duplicate of every book. Matching on the title is
+/// a heuristic, and the honest limit of it is that renaming a document
+/// on device makes it unrecognisable; the alternative, treating each
+/// tablet as an island, produces guaranteed duplicates instead of
+/// occasional misses.
+pub fn find_book_document(xochitl_dir: &Path, parent: &str, title: &str) -> Option<String> {
+    let versioned = format!("{title} (");
+    let mut found: Vec<(bool, String)> = fs::read_dir(xochitl_dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().extension().map(|x| x == "metadata").unwrap_or(false))
+        .filter_map(|e| {
+            let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(e.path()).ok()?).ok()?;
+            if v.get("type").and_then(|t| t.as_str()) != Some("DocumentType")
+                || v.get("parent").and_then(|p| p.as_str()) != Some(parent)
+                || v.get("deleted").and_then(|d| d.as_bool()) == Some(true)
+            {
+                return None;
+            }
+            let name = v.get("visibleName").and_then(|n| n.as_str())?;
+            let exact = name == title;
+            if !exact && !name.starts_with(&versioned) {
+                return None;
+            }
+            let uuid = e.path().file_stem()?.to_str().map(str::to_owned)?;
+            // Exact title first, then deterministic by uuid.
+            Some((!exact, uuid))
+        })
+        .collect();
+    found.sort();
+    found.into_iter().next().map(|(_, uuid)| uuid)
+}
+
 /// Scans the library for a non-deleted collection with this name.
 fn find_collection(xochitl_dir: &Path, name: &str) -> Option<String> {
     let mut found: Vec<String> = fs::read_dir(xochitl_dir)
@@ -207,9 +266,21 @@ pub fn deliver_shelf_card(
     let folder = ensure_folder(xochitl_dir, &mut reg)?;
 
     if let Some(uuid) = &reg.shelf_doc_uuid
-        && xochitl_dir.join(format!("{uuid}.pdf")).exists()
+        && document_is_live(xochitl_dir, uuid)
     {
         let uuid = uuid.clone();
+        save_registry(registry_path, &reg)?;
+        return Ok(uuid);
+    }
+
+    // A card may already be here without this device having made it:
+    // reMarkable's own cloud sync replicates the whole folder between a
+    // reader's devices, so a second tablet finds the first one's card
+    // waiting. Adopt it — creating another leaves two identical entries
+    // in the folder, which is exactly what happened the first time this
+    // was installed alongside an already-synced device.
+    if let Some(uuid) = find_document_named(xochitl_dir, SHELF_CARD_NAME, &folder) {
+        reg.shelf_doc_uuid = Some(uuid.clone());
         save_registry(registry_path, &reg)?;
         return Ok(uuid);
     }
@@ -321,6 +392,20 @@ pub fn deliver(
         && !document_is_live(xochitl_dir, &doc.uuid)
     {
         reg.books.remove(&layout.book_id);
+    }
+
+    // Nothing in the registry, but the book is already in the folder —
+    // it synced in from the reader's other tablet. Adopt it instead of
+    // generating a second copy. The hash is left unknown on purpose, so
+    // the ordinary freeze rules decide what happens next: replaced if it
+    // carries no ink, given a versioned sibling if it does.
+    if !reg.books.contains_key(&layout.book_id)
+        && let Some(uuid) = find_book_document(xochitl_dir, &folder, &layout.title)
+    {
+        reg.books.insert(
+            layout.book_id.clone(),
+            DeliveredDoc { uuid, content_sha256: String::new(), visible_name: visible_name.clone() },
+        );
     }
 
     let delivery = match reg.books.get(&layout.book_id) {
@@ -590,6 +675,94 @@ mod tests {
         assert_eq!(load_registry(&r).books["book9"].uuid, second);
         // And the name is clean: this is a first delivery, not "(更新版)".
         assert_eq!(meta(&x, &second)["visibleName"], "书名");
+    }
+
+    #[test]
+    fn an_already_present_shelf_card_is_adopted_not_duplicated() {
+        // reMarkable's cloud sync copies the folder between a reader's
+        // devices, so a second tablet starts with the first one's card
+        // already in place and no registry entry for it.
+        let (x, r) = temp_dirs("card-adopt");
+        let synced = "cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let folder = "ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        fs::write(
+            x.join(format!("{folder}.metadata")),
+            serde_json::to_string(&serde_json::json!({
+                "visibleName": FOLDER_NAME, "type": "CollectionType", "parent": ""
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            x.join(format!("{synced}.metadata")),
+            serde_json::to_string(&serde_json::json!({
+                "visibleName": SHELF_CARD_NAME, "type": "DocumentType", "parent": folder
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let got = deliver_shelf_card(&x, &r, b"%PDF-card").unwrap();
+        assert_eq!(got, synced, "should adopt the synced card");
+        let cards: Vec<_> = fs::read_dir(&x)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "metadata"))
+            .filter(|e| fs::read_to_string(e.path()).unwrap().contains(SHELF_CARD_NAME))
+            .collect();
+        assert_eq!(cards.len(), 1, "must not leave two identical cards");
+    }
+
+    #[test]
+    fn a_synced_in_book_is_adopted_rather_than_duplicated() {
+        // The reader's other tablet generated this book; reMarkable's
+        // cloud sync brought the document here, but not our registry.
+        let (x, r) = temp_dirs("sync-adopt");
+        let l = layout_for("正文一");
+        // Establish the folder the way a real first run would.
+        let card = deliver_shelf_card(&x, &r, b"%PDF-card").unwrap();
+        let folder = load_registry(&r).folder_uuid.unwrap();
+        assert_eq!(meta(&x, &card)["parent"], folder);
+
+        let synced = "aaaaaaaa-1111-4ccc-8ddd-eeeeeeeeeeee";
+        fs::write(
+            x.join(format!("{synced}.metadata")),
+            serde_json::to_string(&serde_json::json!({
+                "visibleName": "书名", "type": "DocumentType", "parent": folder
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(find_book_document(&x, &folder, "书名").as_deref(), Some(synced));
+
+        // No ink on it, so the freeze rules replace it in place — and
+        // crucially do not mint a second document for the same book.
+        let d = deliver(&x, &r, &l, b"v1").unwrap();
+        assert_eq!(d, Delivery::Replaced { uuid: synced.to_string() });
+        assert_eq!(load_registry(&r).books["book9"].uuid, synced);
+    }
+
+    #[test]
+    fn the_versioned_form_of_a_title_still_matches() {
+        let (x, _r) = temp_dirs("title-match");
+        let folder = "ffffffff-2222-4ccc-8ddd-eeeeeeeeeeee";
+        for (uuid, name) in [
+            ("11111111-2222-4ccc-8ddd-eeeeeeeeeeee", "书名 (更新版)"),
+            ("22222222-2222-4ccc-8ddd-eeeeeeeeeeee", "别的书"),
+        ] {
+            fs::write(
+                x.join(format!("{uuid}.metadata")),
+                serde_json::to_string(&serde_json::json!({
+                    "visibleName": name, "type": "DocumentType", "parent": folder
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        assert!(find_book_document(&x, folder, "书名").is_some());
+        assert!(find_book_document(&x, folder, "不存在的书").is_none());
+        // A different book with a similar prefix must not match.
+        assert!(find_book_document(&x, folder, "别").is_none());
     }
 
     #[test]

@@ -287,6 +287,7 @@ fn publish_shelf(
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let shelf = shelf::sync(agent, &sess.api_key)?;
     let reg = xochitl_doc::load_registry(&paths.registry());
+    let folder = reg.folder_uuid.clone();
     let covers_dir = paths.exthome.join("covers");
     let _ = fs::create_dir_all(&covers_dir);
 
@@ -304,10 +305,16 @@ fn publish_shelf(
             "author": b.author,
             "cover": cover_rel.unwrap_or_default(),
             "finished": b.finish_reading != 0,
+            // Either this device generated it, or it synced in from the
+            // reader's other tablet — both mean "already here", and the
+            // badge would otherwise invite generating a duplicate.
             "generated": reg
                 .books
                 .get(&b.book_id)
-                .is_some_and(|d| xochitl_doc::document_is_live(&paths.xochitl_dir, &d.uuid)),
+                .is_some_and(|d| xochitl_doc::document_is_live(&paths.xochitl_dir, &d.uuid))
+                || folder.as_deref().is_some_and(|f| {
+                    xochitl_doc::find_book_document(&paths.xochitl_dir, f, &b.title).is_some()
+                }),
         }));
     }
 
