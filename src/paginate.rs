@@ -28,6 +28,21 @@ pub struct Page {
 /// Rough width of one character in "columns", where a CJK glyph is 2 and
 /// a Latin one is 1 — the standard monospace-ish approximation, and close
 /// enough for a fixed-width e-ink layout.
+/// Grid columns a character occupies: 2 for full-width, 1 otherwise.
+///
+/// This must agree with what the embedded font actually draws, or the
+/// PDF squeezes a full-width glyph into a half-width cell and the text
+/// after it is dragged left. The ranges below are the CJK blocks, plus
+/// the handful of "East Asian Ambiguous" punctuation marks that Noto
+/// Sans CJK renders full-width even though their codepoints sit in the
+/// Latin/General-Punctuation blocks — curly quotes were the ones that
+/// showed up as visibly wrong on a real page.
+///
+/// Latin letters and ASCII punctuation deliberately do *not* match
+/// their natural advances: the grid gives them a half-width cell and
+/// pdfgen kerns them into it. That is the character-grid design, not a
+/// mismatch. `pdfgen`'s `grid_widths_match_the_font` test encodes
+/// exactly this distinction.
 pub fn char_width(c: char) -> usize {
     let cp = c as u32;
     let wide = matches!(cp,
@@ -39,6 +54,12 @@ pub fn char_width(c: char) -> usize {
         | 0xFF00..=0xFF60    // Fullwidth forms
         | 0xFFE0..=0xFFE6
         | 0x20000..=0x3FFFD  // CJK extensions
+        // Full-width in CJK fonts despite living outside the CJK blocks:
+        | 0x00B7             // · middle dot
+        | 0x2014..=0x2015    // — ― dashes
+        | 0x2018..=0x2019    // ‘ ’
+        | 0x201C..=0x201D    // “ ”
+        | 0x2026             // … ellipsis
     );
     if wide { 2 } else { 1 }
 }

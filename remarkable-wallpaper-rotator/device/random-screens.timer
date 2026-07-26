@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodically rotate the reMarkable sleep-screen wallpaper
+
+[Timer]
+# First run shortly after boot, then repeat. Edit OnUnitActiveSec to change
+# the rotation interval (e.g. 5min, 30min, 1h, 6h), then on the device run:
+#   systemctl daemon-reload && systemctl restart random-screens.timer
+OnBootSec=2min
+OnUnitActiveSec=30min
+Unit=random-screens.service
+
+[Install]
+WantedBy=timers.target

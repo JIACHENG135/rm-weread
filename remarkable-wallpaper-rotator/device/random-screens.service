@@ -1,0 +1,6 @@
+[Unit]
+Description=Rotate reMarkable sleep-screen wallpaper from a folder of images
+
+[Service]
+Type=oneshot
+ExecStart=/usr/share/remarkable/scripts/rotate-wallpaper.sh /home/root/customization/images/suspended /usr/share/remarkable/suspended.png

@@ -921,6 +921,33 @@ mod tests {
     }
 
     #[test]
+    fn grid_widths_match_the_font() {
+        // A full-width glyph squeezed into a half-width cell drags the
+        // rest of the line left — this is how the curly quotes ended up
+        // visibly wrong on a real page. Anything the font draws at a
+        // full em must be two columns.
+        let font = FontInfo::parse(FONT).unwrap();
+        let full_em: Vec<char> = "“”‘’…·、。，！？：；（）《》「」【】一書".chars().collect();
+        for c in full_em {
+            assert_eq!(
+                font.advance(font.gid(c)),
+                1000,
+                "test assumes U+{:04X} {c} is full-width in this font",
+                c as u32
+            );
+            assert_eq!(crate::paginate::char_width(c), 2, "U+{:04X} {c} must be 2 columns", c as u32);
+        }
+
+        // Latin is the deliberate exception: the grid gives it a
+        // half-width cell and line_tj kerns it in, so its natural
+        // advance is *expected* to differ.
+        for c in "aA,.!?".chars() {
+            assert_eq!(crate::paginate::char_width(c), 1);
+            assert_ne!(font.advance(font.gid(c)), 1000);
+        }
+    }
+
+    #[test]
     fn output_is_deterministic() {
         let (layout, chapters) = small_book();
         let a = generate(&layout, &chapters, None).unwrap();

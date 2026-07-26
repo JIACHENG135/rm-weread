@@ -235,8 +235,20 @@ pub fn underline_segments(pages: &[Page], off: usize, len: usize) -> Vec<Underli
 /// Content hash that freezes the geometry: decoded chapter texts plus
 /// every grid constant that influences layout. Any change here must
 /// open a new xochitl document.
+/// Bumped whenever pagination itself changes shape — a new character
+/// width rule, a different line-breaking decision, anything that moves
+/// text on the page.
+///
+/// It has to be in the hash. The grid constants alone don't describe
+/// the *algorithm*, so without this a pagination fix would keep the old
+/// hash, xochitl_doc would treat the rebuild as a decoration-only
+/// refresh, and it would swap re-flowed pages under ink anchored to the
+/// old ones. v2: curly quotes, ellipsis and dashes became full-width.
+pub const LAYOUT_ALGO_VERSION: u32 = 2;
+
 pub fn content_hash(chapters: &[ChapterInput], grid: &Grid, has_cover: bool) -> String {
     let mut h = Sha256::new();
+    h.update(format!("algo:{LAYOUT_ALGO_VERSION}\n"));
     // `has_cover` is in here because a cover occupies page 0 and pushes
     // every chapter page along by one — that is a geometry change, and
     // ink anchored to the old numbering would land on the wrong page.
@@ -535,6 +547,20 @@ mod tests {
         for t in &l.taps {
             assert!(l.hit_tap(t.page, (t.x0 + t.x1) / 2.0, (t.y0 + t.y1) / 2.0).is_some());
         }
+    }
+
+    #[test]
+    fn content_hash_covers_the_pagination_algorithm() {
+        // A pagination change re-flows text. If it didn't move the hash,
+        // xochitl_doc would swap the new pages in under existing ink.
+        let grid = Grid::default();
+        let a = [chapter(1, "一二三", vec![])];
+        let h = content_hash(&a, &grid, false);
+        assert!(h.len() == 64);
+        // The version is genuinely mixed in, not decoration.
+        let mut alt = Sha256::new();
+        alt.update(format!("algo:{}\n", LAYOUT_ALGO_VERSION + 1));
+        assert_ne!(format!("{:x}", alt.finalize())[..8].to_string(), h[..8].to_string());
     }
 
     #[test]
