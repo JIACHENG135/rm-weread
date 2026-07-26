@@ -185,7 +185,10 @@ IMPORT net.asivery.CommandExecutor 1.0
                 if (!t) { mouse.accepted = false; return; }
                 mouse.accepted = true;
                 weReadPopup.quote = "";
-                weReadPopup.reviewsText = "正在加载评论…";
+                weReadPopup.total = "";
+                weReadPopup.errorText = "";
+                weReadPopup.reviews = [];
+                weReadPopup.mode = "loading";
                 weReadPopup.visible = true;
                 weReadPopup.lastSeq = weReadIpc.readSeq("reviews.txt");
                 weReadCmd.executeCommand("/bin/touch", [
@@ -195,31 +198,68 @@ IMPORT net.asivery.CommandExecutor 1.0
             }
         }
 
-        Rectangle {
+        // Shared look. Greys are Apple's system label/separator ramp,
+        // which is what makes this read as a native macOS popover
+        // rather than a generic dialog. No colour: this is e-ink.
+        //
+        // Deliberately NO font.bold anywhere. The shipped NotoSansSC is
+        // a variable font, and synthesising bold from it renders thinner
+        // than the regular weight on device (rm-agent hit this and had
+        // to ship a real static Bold instance). Hierarchy here comes
+        // from size and grey level instead, which needs no extra font.
+        Item {
+            id: weReadStyle
+            visible: false
+            readonly property color ink: "#1D1D1F"
+            readonly property color inkSoft: "#3A3A3C"
+            readonly property color inkMuted: "#8E8E93"
+            readonly property color hairline: "#E5E5EA"
+            readonly property color fill: "#F2F2F7"
+            readonly property color surface: "#FFFFFF"
+            readonly property color edge: "#C6C6C8"
+            readonly property color rim: "#D8D8DC"
+            readonly property int radius: 20
+            readonly property int pad: 28
+        }
+
+        Item {
             id: weReadStatus
             visible: false
             z: 1500
-            color: "white"
-            border.color: "black"
-            border.width: 2
-            radius: 6
-            width: Math.min(parent.width * 0.7, 620)
+            width: Math.min(parent.width * 0.72, 660)
             height: weReadStatusText.implicitHeight + 40
             anchors.horizontalCenter: parent.horizontalCenter
-            y: 24
+            y: 28
             property int lastSeq: 0
             property string message: ""
 
-            Text {
-                id: weReadStatusText
-                anchors.centerIn: parent
-                width: parent.width - 40
-                wrapMode: Text.Wrap
-                horizontalAlignment: Text.AlignHCenter
-                font.family: weReadFont.name
-                font.pixelSize: 24
-                color: "black"
-                text: weReadStatus.message
+            Rectangle {
+                anchors.fill: parent
+                anchors.topMargin: 3
+                anchors.bottomMargin: -3
+                radius: weReadStyle.radius - 4
+                color: weReadStyle.rim
+            }
+
+            Rectangle {
+                anchors.fill: parent
+                radius: weReadStyle.radius - 6
+                color: weReadStyle.surface
+                border.color: weReadStyle.edge
+                border.width: 1
+
+                Text {
+                    id: weReadStatusText
+                    anchors.centerIn: parent
+                    width: parent.width - 48
+                    wrapMode: Text.Wrap
+                    horizontalAlignment: Text.AlignHCenter
+                    font.family: weReadFont.name
+                    font.pixelSize: 23
+                    lineHeight: 1.25
+                    color: weReadStyle.inkSoft
+                    text: weReadStatus.message
+                }
             }
 
             MouseArea {
@@ -264,62 +304,219 @@ IMPORT net.asivery.CommandExecutor 1.0
             onTriggered: weReadStatus.visible = false
         }
 
-        Rectangle {
+        Item {
             id: weReadPopup
             visible: false
             z: 1500
-            color: "white"
-            border.color: "black"
-            border.width: 2
-            radius: 8
-            width: Math.min(parent.width * 0.8, 900)
-            height: Math.min(parent.height * 0.6, 1100)
+            width: Math.min(parent.width * 0.82, 940)
+            height: Math.min(parent.height * 0.64, 1200)
             anchors.centerIn: parent
+
             property int lastSeq: 0
             property string quote: ""
-            property string reviewsText: ""
+            property string total: ""
+            property string errorText: ""
+            // Array of { author, content } — a plain JS array rather
+            // than a ListModel so this needs no extra QML import inside
+            // xochitl's own module set.
+            property var reviews: []
+            // "loading" | "ok" | "error"
+            property string mode: "loading"
 
-            Text {
-                id: weReadQuote
-                anchors.top: parent.top
-                anchors.topMargin: 24
-                anchors.left: parent.left
-                anchors.leftMargin: 28
-                anchors.right: parent.right
-                anchors.rightMargin: 28
-                wrapMode: Text.Wrap
-                maximumLineCount: 3
-                elide: Text.ElideRight
-                font.family: weReadFont.name
-                font.pixelSize: 26
-                font.bold: true
-                color: "black"
-                visible: text.length > 0
-                text: weReadPopup.quote
+            // Depth without transparency: a translucent drop shadow
+            // dithers into visible speckle on e-ink, while a solid grey
+            // rim peeking out below the card stays crisp at 1 bit.
+            Rectangle {
+                anchors.fill: parent
+                anchors.topMargin: 4
+                anchors.bottomMargin: -4
+                radius: weReadStyle.radius + 2
+                color: weReadStyle.rim
             }
 
-            Flickable {
-                anchors.top: weReadQuote.visible ? weReadQuote.bottom : parent.top
-                anchors.topMargin: 20
-                anchors.bottom: parent.bottom
-                anchors.bottomMargin: 24
-                anchors.left: parent.left
-                anchors.leftMargin: 28
-                anchors.right: parent.right
-                anchors.rightMargin: 28
-                contentHeight: weReadReviews.implicitHeight
+            Rectangle {
+                anchors.fill: parent
+                radius: weReadStyle.radius
+                color: weReadStyle.surface
+                border.color: weReadStyle.edge
+                border.width: 1
                 clip: true
 
+                Column {
+                    id: weReadHeader
+                    anchors.top: parent.top
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.margins: weReadStyle.pad
+                    spacing: 14
+
+                    Row {
+                        width: parent.width
+                        spacing: 16
+
+                        // Blockquote rule, matched to the quote's height.
+                        Rectangle {
+                            width: 4
+                            height: weReadQuote.height
+                            radius: 2
+                            color: weReadStyle.inkMuted
+                            visible: weReadQuote.visible
+                        }
+
+                        Text {
+                            id: weReadQuote
+                            width: parent.width - 20
+                            wrapMode: Text.Wrap
+                            maximumLineCount: 3
+                            elide: Text.ElideRight
+                            font.family: weReadFont.name
+                            font.pixelSize: 27
+                            lineHeight: 1.3
+                            color: weReadStyle.ink
+                            visible: text.length > 0
+                            text: weReadPopup.quote
+                        }
+                    }
+
+                    Text {
+                        font.family: weReadFont.name
+                        font.pixelSize: 20
+                        color: weReadStyle.inkMuted
+                        visible: weReadPopup.mode === "ok"
+                        text: weReadPopup.total + " 条想法"
+                    }
+                }
+
+                Rectangle {
+                    id: weReadHeaderRule
+                    anchors.top: weReadHeader.bottom
+                    anchors.topMargin: weReadStyle.pad - 8
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    height: 1
+                    color: weReadStyle.hairline
+                    visible: weReadPopup.mode === "ok" && weReadPopup.reviews.length > 0
+                }
+
+                // Loading / empty / error all land here, centred and
+                // quiet — never an alarming black wall of text.
                 Text {
-                    id: weReadReviews
-                    width: parent.width
+                    anchors.top: weReadHeaderRule.bottom
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    anchors.margins: weReadStyle.pad
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
                     wrapMode: Text.Wrap
                     font.family: weReadFont.name
-                    font.pixelSize: 24
-                    lineHeight: 1.3
-                    color: "black"
-                    textFormat: Text.PlainText
-                    text: weReadPopup.reviewsText
+                    font.pixelSize: 23
+                    color: weReadStyle.inkMuted
+                    visible: weReadPopup.mode !== "ok" || weReadPopup.reviews.length === 0
+                    text: weReadPopup.mode === "error" ? weReadPopup.errorText
+                        : weReadPopup.mode === "loading" ? "正在加载评论…"
+                        : "还没有人写想法"
+                }
+
+                Flickable {
+                    id: weReadFlick
+                    anchors.top: weReadHeaderRule.bottom
+                    anchors.bottom: parent.bottom
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    contentHeight: weReadList.height
+                    clip: true
+                    visible: weReadPopup.mode === "ok" && weReadPopup.reviews.length > 0
+                    boundsBehavior: Flickable.StopAtBounds
+
+                    Column {
+                        id: weReadList
+                        width: weReadFlick.width
+
+                        Repeater {
+                            model: weReadPopup.reviews
+
+                            delegate: Item {
+                                width: weReadList.width
+                                height: weReadBody.height + 44
+
+                                Rectangle {
+                                    id: weReadAvatar
+                                    x: weReadStyle.pad
+                                    y: 22
+                                    width: 46
+                                    height: 46
+                                    radius: 23
+                                    color: weReadStyle.fill
+                                    border.color: weReadStyle.hairline
+                                    border.width: 1
+
+                                    Text {
+                                        anchors.centerIn: parent
+                                        font.family: weReadFont.name
+                                        font.pixelSize: 22
+                                        color: weReadStyle.inkMuted
+                                        text: (modelData.author || "?").substring(0, 1)
+                                    }
+                                }
+
+                                Column {
+                                    id: weReadBody
+                                    y: 22
+                                    anchors.left: weReadAvatar.right
+                                    anchors.leftMargin: 16
+                                    anchors.right: parent.right
+                                    anchors.rightMargin: weReadStyle.pad
+                                    spacing: 7
+
+                                    Text {
+                                        font.family: weReadFont.name
+                                        font.pixelSize: 21
+                                        color: weReadStyle.inkMuted
+                                        text: modelData.author
+                                    }
+
+                                    Text {
+                                        width: parent.width
+                                        wrapMode: Text.Wrap
+                                        textFormat: Text.PlainText
+                                        font.family: weReadFont.name
+                                        font.pixelSize: 25
+                                        lineHeight: 1.35
+                                        color: weReadStyle.inkSoft
+                                        text: modelData.content
+                                    }
+                                }
+
+                                // Inset separator, aligned to the text
+                                // column rather than the card edge.
+                                Rectangle {
+                                    anchors.bottom: parent.bottom
+                                    anchors.left: parent.left
+                                    anchors.leftMargin: weReadStyle.pad + 62
+                                    anchors.right: parent.right
+                                    height: 1
+                                    color: weReadStyle.hairline
+                                    visible: index < weReadPopup.reviews.length - 1
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Overlay scroller, macOS style: only there when the
+                // content actually overflows.
+                Rectangle {
+                    width: 4
+                    radius: 2
+                    color: weReadStyle.edge
+                    anchors.right: parent.right
+                    anchors.rightMargin: 8
+                    visible: weReadFlick.visible && weReadFlick.contentHeight > weReadFlick.height
+                    height: Math.max(48, weReadFlick.height * weReadFlick.height / Math.max(1, weReadFlick.contentHeight))
+                    y: weReadFlick.y + weReadFlick.contentY
+                       * (weReadFlick.height - height)
+                       / Math.max(1, weReadFlick.contentHeight - weReadFlick.height)
                 }
             }
         }
@@ -350,25 +547,29 @@ IMPORT net.asivery.CommandExecutor 1.0
                     var status = lines.length > 1 ? lines[1] : "";
                     if (status === "ok") {
                         weReadPopup.quote = lines.length > 2 ? lines[2] : "";
-                        var total = lines.length > 3 ? lines[3] : "0";
-                        var body = "";
+                        weReadPopup.total = lines.length > 3 ? lines[3] : "0";
+                        var list = [];
                         for (var i = 4; i < lines.length; i++) {
                             if (!lines[i]) continue;
                             var tab = lines[i].indexOf("\t");
-                            var author = tab >= 0 ? lines[i].substring(0, tab) : "";
-                            var content = tab >= 0 ? lines[i].substring(tab + 1) : lines[i];
-                            body += (body ? "\n\n" : "") + author + "：" + content;
+                            list.push({
+                                author: tab >= 0 ? lines[i].substring(0, tab) : "读者",
+                                content: tab >= 0 ? lines[i].substring(tab + 1) : lines[i]
+                            });
                         }
-                        weReadPopup.reviewsText = (total + " 条想法\n\n") + (body || "（还没有想法）");
+                        weReadPopup.reviews = list;
+                        weReadPopup.mode = "ok";
                     } else {
-                        weReadPopup.reviewsText = lines.length > 2 ? lines.slice(2).join(" ") : "(出错)";
+                        weReadPopup.errorText = lines.length > 2 ? lines.slice(2).join(" ") : "出错了";
+                        weReadPopup.mode = "error";
                     }
                     elapsedMs = 0;
                     stop();
                     return;
                 }
                 if (elapsedMs > 20000) {
-                    weReadPopup.reviewsText = "(超时，请重试)";
+                    weReadPopup.errorText = "加载超时，请重试";
+                    weReadPopup.mode = "error";
                     elapsedMs = 0;
                     stop();
                 }
