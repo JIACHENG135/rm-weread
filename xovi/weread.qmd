@@ -71,6 +71,15 @@ IMPORT net.asivery.CommandExecutor 1.0
         Item {
             id: weReadIpc
             visible: false
+            function beacon(name) {
+                weReadCmd.executeCommand("/bin/touch", ["/home/root/xovi/exthome/weread/beacon_" + name]);
+            }
+
+            // console.log is invisible here — xochitl installs its own
+            // Qt message handler and QT_LOGGING_RULES does not get past
+            // it, so every "no output" reading during this experiment
+            // was uninformative rather than negative. Beacons are files.
+            Component.onCompleted: beacon("ipc")
             // Layouts are stored per *document* uuid, so several books
             // can be on the device at once. Each is a few hundred KB and
             // JSON.parse blocks the UI thread, so parse at most once per
@@ -96,6 +105,76 @@ IMPORT net.asivery.CommandExecutor 1.0
                 return isNaN(n) ? 0 : n;
             }
 
+            // chapterUid -> tap boxes fetched while reading, and the
+            // set already asked for so a page turn inside one chapter
+            // doesn't re-trigger. Underlines are no longer baked into
+            // layout.json for newly generated books: they are fetched
+            // one chapter at a time, when you actually reach it.
+            property var hotByChapter: ({})
+            property var hotAsked: ({})
+            property int hotSeq: 0
+
+            // Chapter covering an absolute page, or null.
+            function chapterAt(page) {
+                var l = layoutData;
+                if (!l || !l.chapters) return null;
+                for (var i = 0; i < l.chapters.length; i++) {
+                    var c = l.chapters[i];
+                    if (page >= c.page_start && page < c.page_start + c.page_count) return c;
+                }
+                return null;
+            }
+
+            // Every tap box known for `page`: whatever the frozen layout
+            // carries (older books, where they were baked in) plus
+            // anything fetched at reading time.
+            function tapsForPage(page) {
+                var out = [];
+                var l = layoutData;
+                if (l && l.taps) {
+                    for (var i = 0; i < l.taps.length; i++) {
+                        if (l.taps[i].page === page) out.push(l.taps[i]);
+                    }
+                }
+                for (var uid in hotByChapter) {
+                    var set = hotByChapter[uid];
+                    for (var j = 0; j < set.length; j++) {
+                        if (set[j].page === page) out.push(set[j]);
+                    }
+                }
+                return out;
+            }
+
+            // Ask the daemon for this page's chapter, once.
+            function requestHot(page) {
+                var l = layoutData;
+                if (!l || !l.book_id) return;
+                var c = chapterAt(page);
+                if (!c) return;
+                var key = "" + c.chapter_uid;
+                if (hotAsked[key] || hotByChapter[key]) return;
+                hotAsked[key] = true;
+                weReadCmd.executeCommand("/bin/touch", [
+                    "/home/root/xovi/exthome/weread/hot_" + l.book_id + "_" + c.chapter_uid
+                        + "_" + Date.now()
+                ]);
+                weReadHotPoller.restart();
+            }
+
+            function loadHot(bookId, chapterUid) {
+                var raw = readFile("hot/" + bookId + "_" + chapterUid + ".json");
+                if (!raw) return false;
+                try {
+                    var arr = JSON.parse(raw);
+                    var m = hotByChapter;
+                    m["" + chapterUid] = arr;
+                    hotByChapter = m;
+                    return true;
+                } catch (e) {
+                    return false;
+                }
+            }
+
             // Layout for whatever document is open, or null. Because
             // the file is keyed by document uuid, finding one *is* the
             // proof that this PDF is ours — no separate doc_uuid check.
@@ -105,6 +184,8 @@ IMPORT net.asivery.CommandExecutor 1.0
                 if (layoutDocId === id) return layoutData;
                 layoutDocId = id;
                 layoutData = null;
+                hotByChapter = ({});
+                hotAsked = ({});
                 var raw = readFile("layout/" + id + ".json");
                 if (raw) {
                     try { layoutData = JSON.parse(raw); } catch (e) { layoutData = null; }
@@ -184,11 +265,11 @@ IMPORT net.asivery.CommandExecutor 1.0
             // where a range wraps onto the next row, so the nearest
             // centre wins.
             function hitTap(page, nx, ny) {
-                if (!layoutData || !layoutData.taps) return null;
+                if (!layoutData) return null;
+                var candidates = tapsForPage(page);
                 var best = null, bestDist = 1e9;
-                for (var i = 0; i < layoutData.taps.length; i++) {
-                    var t = layoutData.taps[i];
-                    if (t.page !== page) continue;
+                for (var i = 0; i < candidates.length; i++) {
+                    var t = candidates[i];
                     if (nx < t.x0 || nx > t.x1 || ny < t.y0 || ny > t.y1) continue;
                     var d = Math.abs(nx - (t.x0 + t.x1) / 2) + Math.abs(ny - (t.y0 + t.y1) / 2);
                     if (d < bestDist) { bestDist = d; best = t; }
@@ -538,6 +619,107 @@ IMPORT net.asivery.CommandExecutor 1.0
                     elapsedMs = 0;
                     stop();
                 }
+            }
+        }
+
+
+        // Live underline overlay.
+        //
+        // Proven on device, in this order: QML does paint over
+        // xochitl's PDF surface, the layer survives page turns, and pen
+        // ink lands *on top* of it rather than being erased by it — the
+        // one thing that killed the old fullscreen reader. The catch
+        // found in the same test: anything opaque hides ink behind it,
+        // so this draws hairlines under the baseline and never fills.
+        //
+        // Written in the idiom the shelf browser already proves works
+        // (Repeater over a plain JS array, Rectangle delegates). The
+        // first attempt used a tiled Image, a var-array property and a
+        // polling Timer together, and stopped the entire injected block
+        // from instantiating with no error logged at all.
+        Item {
+            id: weReadOverlay
+            anchors.fill: parent
+            z: 700
+
+            // Same binding idiom as weReadIpc.docId, which works.
+            property int curPage: {
+                try {
+                    return touchArea.view ? touchArea.view.page : -1;
+                } catch (e) {
+                    return -1;
+                }
+            }
+
+            property var rules: []
+
+            // Verification offset: drawn 10px below the printed rule so
+            // the two can be told apart. Zero once the underlines stop
+            // being burned into the PDF.
+            readonly property int probeOffset: 10
+
+            onCurPageChanged: rebuild()
+            Component.onCompleted: rebuild()
+
+            function rebuild() {
+                var page = weReadIpc.currentPage();
+                var l = weReadIpc.layoutData;
+                if (page < 0 || !l) { rules = []; return; }
+                weReadIpc.requestHot(page);
+                var r;
+                try { r = touchArea.view.pageBorderRect; } catch (e) { rules = []; return; }
+                if (!r || !(r.width > 0)) { rules = []; return; }
+
+                var out = [];
+                var taps = weReadIpc.tapsForPage(page);
+                for (var i = 0; i < taps.length; i++) {
+                    var t = taps[i];
+                    // The rule sits at baseline + 3pt inside the line
+                    // box; a tap box is the line box plus 30% slop
+                    // below, so the line height is (y1 - y0) / 1.3.
+                    var lineH = (t.y1 - t.y0) / 1.3;
+                    out.push({
+                        rx: r.x + t.x0 * r.width,
+                        ry: r.y + (t.y0 + 0.78 * lineH + 3.0 / 936.0) * r.height + probeOffset,
+                        rw: (t.x1 - t.x0) * r.width
+                    });
+                }
+                rules = out;
+                weReadIpc.beacon("rules_p" + page + "_n" + out.length);
+            }
+
+            Repeater {
+                model: weReadOverlay.rules
+                delegate: Rectangle {
+                    x: modelData.rx
+                    y: modelData.ry
+                    width: modelData.rw
+                    height: 3
+                    color: "black"
+                }
+            }
+        }
+
+        Timer {
+            id: weReadHotPoller
+            interval: 700
+            repeat: true
+            property int elapsedMs: 0
+            onTriggered: {
+                elapsedMs += interval;
+                var lines = weReadIpc.readFile("hot.txt").split("\n");
+                var seq = parseInt(lines[0]);
+                if (!isNaN(seq) && seq > weReadIpc.hotSeq) {
+                    weReadIpc.hotSeq = seq;
+                    var parts = (lines.length > 2 ? lines[2] : "").split(" ");
+                    if (parts.length >= 2 && weReadIpc.loadHot(parts[0], parts[1])) {
+                        weReadOverlay.rebuild();
+                    }
+                    elapsedMs = 0;
+                    stop();
+                    return;
+                }
+                if (elapsedMs > 30000) { elapsedMs = 0; stop(); }
             }
         }
 

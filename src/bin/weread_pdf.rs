@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let generated =
-        pipeline::generate_book(&agent, &mut sess, &paths, &book_id, &title, &author, &cover, |note| {
+        pipeline::generate_book(&agent, &mut sess, &paths, &book_id, &title, &author, &cover, pipeline::HotPolicy::ReuseKnown, |note| {
             println!("  {note}");
         })?;
     session::save(&path, &sess)?;

@@ -57,9 +57,6 @@ pub struct DeliveredDoc {
     pub uuid: String,
     pub content_sha256: String,
     pub visible_name: String,
-    /// Unix seconds of the last underline-decoration refresh.
-    #[serde(default)]
-    pub decorations_refreshed_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -335,7 +332,6 @@ pub fn deliver(
                     uuid: uuid.clone(),
                     content_sha256: layout.content_sha256.clone(),
                     visible_name: name,
-                    decorations_refreshed_at: 0,
                 },
             );
             save_registry(registry_path, &reg)?;

@@ -145,6 +145,10 @@ fn chapter_xhtml(
 /// Underlines are still optional — a chapter that has never been fetched
 /// successfully just has none — but a failed call must never be allowed
 /// to look like "this chapter has fewer underlines now".
+fn clone_hot(h: &layout::Hot) -> layout::HotInput {
+    layout::HotInput { range: h.range.clone(), off: h.off, len: h.len, count: h.count }
+}
+
 fn fetch_hot(
     agent: &ureq::Agent,
     api_key: &str,
@@ -156,16 +160,7 @@ fn fetch_hot(
     match underlines::fetch_underlines(agent, api_key, book_id, chapter_uid) {
         Ok(u) => underlines::map_to_text(&u, text),
         Err(e) => {
-            let kept: Vec<layout::HotInput> = previous
-                .unwrap_or_default()
-                .iter()
-                .map(|h| layout::HotInput {
-                    range: h.range.clone(),
-                    off: h.off,
-                    len: h.len,
-                    count: h.count,
-                })
-                .collect();
+            let kept: Vec<layout::HotInput> = previous.unwrap_or_default().iter().map(clone_hot).collect();
             if kept.is_empty() {
                 eprintln!("weread: underlines for chapter {chapter_uid} failed ({e}); continuing without");
             } else {
@@ -190,6 +185,7 @@ fn build_chapters(
     book_id: &str,
     chapters: &[reader::Chapter],
     grid: &Grid,
+    hot_policy: HotPolicy,
     mut progress: impl FnMut(&str),
 ) -> Result<Vec<ChapterInput>, Box<dyn std::error::Error>> {
     // What the last successful build knew, so a throttled call this time
@@ -203,14 +199,13 @@ fn build_chapters(
         progress(&format!("章节 {}/{}: {}", i + 1, chapters.len(), ch.title));
         let xhtml_raw = chapter_xhtml(agent, sess, paths, book_id, ch)?;
         let text = xhtml::to_text(&xhtml_raw);
-        let hot = fetch_hot(
-            agent,
-            &sess.api_key,
-            book_id,
-            ch.chapter_uid,
-            &text,
-            known.get(&ch.chapter_uid).map(Vec::as_slice),
-        );
+        let previous = known.get(&ch.chapter_uid).map(Vec::as_slice);
+        let hot = match hot_policy {
+            HotPolicy::Fetch => {
+                fetch_hot(agent, &sess.api_key, book_id, ch.chapter_uid, &text, previous)
+            }
+            HotPolicy::ReuseKnown => previous.unwrap_or_default().iter().map(clone_hot).collect(),
+        };
         let pages = paginate::paginate(&text.text, grid.cols, grid.lines_per_page);
         inputs.push(ChapterInput {
             chapter_uid: ch.chapter_uid,
@@ -228,6 +223,20 @@ pub struct Generated {
     pub delivery: Delivery,
 }
 
+/// Where a build gets its hot underlines from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HotPolicy {
+    /// One `/book/underlines` call per chapter. This is what turned a
+    /// 288-chapter book into 288 requests inside a few minutes and got
+    /// the client throttled (HTTP 499, then a gateway-wide 403).
+    Fetch,
+    /// No underline requests at all — reuse whatever the previous build
+    /// recorded. Regenerating for an unrelated reason (a pagination
+    /// fix, say) must not cost a request storm, and underlines are
+    /// fetched per-chapter at reading time now.
+    ReuseKnown,
+}
+
 /// The whole pipeline for one book. Writes layout.json (data dir +
 /// exthome copy for QML) and returns what happened.
 pub fn generate_book(
@@ -238,6 +247,7 @@ pub fn generate_book(
     title: &str,
     author: &str,
     cover_url: &str,
+    hot_policy: HotPolicy,
     progress: impl FnMut(&str),
 ) -> Result<Generated, Box<dyn std::error::Error>> {
     reader::renew_session(agent, &mut sess.cookies)?;
@@ -247,7 +257,7 @@ pub fn generate_book(
     }
     let grid = Grid::default();
     let cover = fetch_cover(agent, &paths.cover_file(book_id), &largest_cover_url(cover_url));
-    let inputs = build_chapters(agent, sess, paths, book_id, &chapters, &grid, progress)?;
+    let inputs = build_chapters(agent, sess, paths, book_id, &chapters, &grid, hot_policy, progress)?;
     // A title page is always page 0, artwork or not — see fetch_cover.
     finish_build(paths, book_id, title, author, inputs, grid, true, cover)
 }
@@ -295,94 +305,42 @@ fn write_layout(paths: &Paths, l: &BookLayout) -> std::io::Result<()> {
     fs::rename(tmp, dir.join(format!("{}.json", l.doc_uuid)))
 }
 
+/// Hot underlines for one chapter, as tap boxes on the frozen layout.
+///
+/// This is the reading-time half of the lazy design: one
+/// `/book/underlines` call for the chapter you actually reached,
+/// instead of one per chapter up front. The text comes from the local
+/// chapter cache, never the network — the boxes have to be computed
+/// from *exactly* the text that froze the geometry, and re-downloading
+/// could hand us something else.
+pub fn hot_for_chapter(
+    agent: &ureq::Agent,
+    api_key: &str,
+    paths: &Paths,
+    book_id: &str,
+    chapter_uid: i64,
+) -> Result<Vec<layout::Tap>, Box<dyn std::error::Error>> {
+    let book = load_layout(paths, book_id).ok_or("no layout for this book — generate it first")?;
+    let chapter = book
+        .chapters
+        .iter()
+        .find(|c| c.chapter_uid == chapter_uid)
+        .ok_or("chapter is not part of this book's layout")?;
+
+    let cache = paths.chapter_cache(book_id, chapter_uid);
+    let raw = fs::read_to_string(&cache)
+        .map_err(|e| format!("chapter cache missing for {chapter_uid}: {e}"))?;
+    let text = xhtml::to_text(&raw);
+    let pages = paginate::paginate(&text.text, book.grid.cols, book.grid.lines_per_page);
+
+    let underlines = underlines::fetch_underlines(agent, api_key, book_id, chapter_uid)?;
+    let mapped = underlines::map_to_text(&underlines, &text);
+    Ok(layout::chapter_taps(&book.grid, &pages, chapter.page_start, chapter_uid, &mapped))
+}
+
 pub fn load_layout(paths: &Paths, book_id: &str) -> Option<BookLayout> {
     let s = fs::read_to_string(paths.layout_file(book_id)).ok()?;
     serde_json::from_str(&s).ok()
-}
-
-/// Fraction of the hot-underline set that changed between the frozen
-/// layout and a fresh fetch: |symmetric difference| / |union|, ranges
-/// as identity. 0.0 = identical, 1.0 = disjoint.
-pub fn hot_change_fraction(old: &BookLayout, fresh: &[(i64, Vec<String>)]) -> f32 {
-    use std::collections::BTreeSet;
-    let old_set: BTreeSet<(i64, &str)> = old
-        .chapters
-        .iter()
-        .flat_map(|c| c.hot.iter().map(move |h| (c.chapter_uid, h.range.as_str())))
-        .collect();
-    let new_set: BTreeSet<(i64, &str)> = fresh
-        .iter()
-        .flat_map(|(uid, ranges)| ranges.iter().map(move |r| (*uid, r.as_str())))
-        .collect();
-    let union = old_set.union(&new_set).count();
-    if union == 0 {
-        return 0.0;
-    }
-    let sym_diff = old_set.symmetric_difference(&new_set).count();
-    sym_diff as f32 / union as f32
-}
-
-/// How different the hot sets must be before a decoration refresh
-/// actually rewrites the PDF (the design conversation settled on
-/// "significant change only" to keep the risky swap-in-place rare).
-pub const REFRESH_THRESHOLD: f32 = 0.2;
-
-/// Daily decoration refresh for one already-generated book: re-fetch
-/// underlines, and only if the set moved beyond the threshold, rebuild
-/// the PDF from *cached* text (frozen geometry) and swap it in place.
-/// Returns whether a rebuild happened.
-pub fn refresh_decorations(
-    agent: &ureq::Agent,
-    sess: &mut login::Session,
-    paths: &Paths,
-    book_id: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let old = load_layout(paths, book_id).ok_or("no layout.json for this book — generate first")?;
-
-    // Fresh hot sets, per chapter (range ids only, for the diff).
-    let mut fresh_ranges = Vec::new();
-    let mut fresh_hot: Vec<Vec<underlines::Underline>> = Vec::new();
-    for c in &old.chapters {
-        let u = underlines::fetch_underlines(agent, &sess.api_key, book_id, c.chapter_uid).unwrap_or_default();
-        fresh_ranges.push((c.chapter_uid, u.iter().map(|x| x.range.clone()).collect::<Vec<_>>()));
-        fresh_hot.push(u);
-    }
-    if hot_change_fraction(&old, &fresh_ranges) <= REFRESH_THRESHOLD {
-        return Ok(false);
-    }
-
-    // Rebuild chapter inputs from the cache — never from the network,
-    // so the geometry provably can't drift (content hash re-checked by
-    // deliver() anyway).
-    let mut inputs = Vec::new();
-    for (c, hot) in old.chapters.iter().zip(fresh_hot) {
-        let cache = paths.chapter_cache(book_id, c.chapter_uid);
-        let raw = fs::read_to_string(&cache)
-            .map_err(|e| format!("chapter cache missing for {}: {e} — cannot refresh frozen geometry", c.chapter_uid))?;
-        let text = xhtml::to_text(&raw);
-        let mapped = underlines::map_to_text(&hot, &text);
-        inputs.push(ChapterInput {
-            chapter_uid: c.chapter_uid,
-            title: c.title.clone(),
-            pages: paginate::paginate(&text.text, old.grid.cols, old.grid.lines_per_page),
-            text: text.text,
-            hot: mapped,
-        });
-    }
-    // Cache only: re-downloading here could hand us different bytes, and
-    // a *missing* cover would silently drop page 0 and shift the whole
-    // book under the reader's ink.
-    let cover = fs::read(paths.cover_file(book_id)).ok();
-    let generated =
-        finish_build(paths, book_id, &old.title, &old.author, inputs, old.grid, old.cover, cover)?;
-    // A decoration refresh must never have changed geometry.
-    if generated.layout.content_sha256 != old.content_sha256 {
-        eprintln!(
-            "weread: WARNING — refresh produced a different content hash for {book_id}; \
-             cached text changed under us (delivered as a new/replaced document, ink protected)"
-        );
-    }
-    Ok(true)
 }
 
 #[cfg(test)]
@@ -407,56 +365,6 @@ mod tests {
         assert_eq!(largest_cover_url("https://c/x/plain.jpg"), "https://c/x/plain.jpg");
         assert_eq!(largest_cover_url(""), "");
     }
-    use crate::layout::{Grid, HotInput, build};
-    use crate::paginate::paginate;
 
-    fn layout_with_hot(ranges: &[(i64, &[&str])]) -> BookLayout {
-        let grid = Grid { cols: 10, lines_per_page: 4, ..Grid::default() };
-        let chapters: Vec<ChapterInput> = ranges
-            .iter()
-            .map(|(uid, rs)| {
-                let text = "一二三四五六七八九十".repeat(3);
-                ChapterInput {
-                    chapter_uid: *uid,
-                    title: format!("第{uid}章"),
-                    pages: paginate(&text, grid.cols, grid.lines_per_page),
-                    text,
-                    hot: rs
-                        .iter()
-                        .enumerate()
-                        .map(|(i, r)| HotInput { range: r.to_string(), off: i * 2, len: 2, count: 10 })
-                        .collect(),
-                }
-            })
-            .collect();
-        build("b", "t", "a", &chapters, grid, false)
-    }
 
-    #[test]
-    fn change_fraction_zero_for_identical_sets() {
-        let l = layout_with_hot(&[(1, &["1-2", "3-4"])]);
-        let fresh = vec![(1i64, vec!["1-2".to_string(), "3-4".to_string()])];
-        assert_eq!(hot_change_fraction(&l, &fresh), 0.0);
-    }
-
-    #[test]
-    fn change_fraction_one_for_disjoint_sets() {
-        let l = layout_with_hot(&[(1, &["1-2"])]);
-        let fresh = vec![(1i64, vec!["9-10".to_string()])];
-        assert_eq!(hot_change_fraction(&l, &fresh), 1.0);
-    }
-
-    #[test]
-    fn change_fraction_partial() {
-        let l = layout_with_hot(&[(1, &["1-2", "3-4", "5-6"])]);
-        // One of three replaced: union = 4, sym diff = 2.
-        let fresh = vec![(1i64, vec!["1-2".to_string(), "3-4".to_string(), "7-8".to_string()])];
-        assert_eq!(hot_change_fraction(&l, &fresh), 0.5);
-    }
-
-    #[test]
-    fn change_fraction_handles_empty_both_sides() {
-        let l = layout_with_hot(&[(1, &[])]);
-        assert_eq!(hot_change_fraction(&l, &[]), 0.0);
-    }
 }

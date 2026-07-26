@@ -283,6 +283,44 @@ pub fn content_hash(chapters: &[ChapterInput], grid: &Grid, has_cover: bool) -> 
 /// falls into the gap between rows.
 const TAP_SLOP_BELOW: f32 = 0.3;
 
+/// Tap boxes for one chapter's hot underlines, in absolute pages.
+///
+/// Shared by the frozen build and by the runtime path that fetches a
+/// chapter's underlines while you are reading it: both must produce
+/// byte-identical geometry, so neither may reimplement this. (The QML
+/// overlay draws these boxes; letting it re-derive them would mean
+/// duplicating pagination in JavaScript.)
+pub fn chapter_taps(
+    grid: &Grid,
+    pages: &[Page],
+    page_start: usize,
+    chapter_uid: i64,
+    hot: &[HotInput],
+) -> Vec<Tap> {
+    // Deterministic order: by text position, not by whatever order the
+    // API returned — this is part of a frozen artifact.
+    let mut sorted: Vec<&HotInput> = hot.iter().collect();
+    sorted.sort_by_key(|h| (h.off, h.len));
+    let mut out = Vec::new();
+    for h in sorted {
+        // Every underlined run is its own tap target; a range that
+        // wraps just yields several boxes with the same `range`.
+        for seg in underline_segments(pages, h.off, h.len) {
+            out.push(tap_box(
+                grid,
+                page_start + seg.page,
+                seg.row,
+                seg.col_start,
+                seg.col_end,
+                chapter_uid,
+                &h.range,
+                h.count,
+            ));
+        }
+    }
+    out
+}
+
 /// Builds the frozen layout for a whole book. Chapter order is PDF
 /// order; each chapter starts on a fresh page.
 pub fn build(
@@ -314,33 +352,13 @@ pub fn build(
             }
         }
 
-        let mut hot_out = Vec::new();
-        // Deterministic order: by text position, not by whatever order
-        // the API returned — `taps` is part of the frozen artifact.
+        taps.extend(chapter_taps(&grid, &c.pages, page_cursor, c.chapter_uid, &c.hot));
         let mut hot_sorted: Vec<&HotInput> = c.hot.iter().collect();
         hot_sorted.sort_by_key(|h| (h.off, h.len));
-        for h in hot_sorted {
-            // Every underlined run is its own tap target; a range that
-            // wraps just yields several boxes with the same `range`.
-            for seg in underline_segments(&c.pages, h.off, h.len) {
-                taps.push(tap_box(
-                    &grid,
-                    page_cursor + seg.page,
-                    seg.row,
-                    seg.col_start,
-                    seg.col_end,
-                    c.chapter_uid,
-                    &h.range,
-                    h.count,
-                ));
-            }
-            hot_out.push(Hot {
-                range: h.range.clone(),
-                off: h.off,
-                len: h.len,
-                count: h.count,
-            });
-        }
+        let hot_out: Vec<Hot> = hot_sorted
+            .iter()
+            .map(|h| Hot { range: h.range.clone(), off: h.off, len: h.len, count: h.count })
+            .collect();
 
         out_chapters.push(ChapterLayout {
             chapter_uid: c.chapter_uid,

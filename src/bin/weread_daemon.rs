@@ -36,7 +36,6 @@ const SESSION_PATH: &str = "/home/root/.local/share/rm-weread/session.json";
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Decoration refresh cadence. The hot-underline set moves on a scale
 /// of weeks; daily is already generous (and threshold-gated besides).
-const REFRESH_EVERY_SECS: u64 = 24 * 60 * 60;
 
 fn exthome() -> PathBuf {
     Paths::device().exthome
@@ -113,6 +112,66 @@ fn take_asks() -> Vec<(String, i64, String)> {
         asks.push((parts[0].to_string(), uid, parts[2].to_string()));
     }
     asks
+}
+
+/// Scans for `hot_<bookId>_<chapterUid>_<nonce>` triggers — the QML
+/// overlay asking for the underlines of the chapter you just reached.
+fn take_hot_requests() -> Vec<(String, i64)> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(exthome()) else { return out };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix("hot_") else { continue };
+        let _ = fs::remove_file(entry.path());
+        let parts: Vec<&str> = rest.splitn(3, '_').collect();
+        if parts.len() < 2 {
+            eprintln!("weread: malformed hot trigger: {name}");
+            continue;
+        }
+        match parts[1].parse::<i64>() {
+            Ok(uid) => out.push((parts[0].to_string(), uid)),
+            Err(_) => eprintln!("weread: malformed hot chapterUid: {name}"),
+        }
+    }
+    out
+}
+
+/// Answers one overlay request: fetch that chapter's underlines and
+/// write its tap boxes where QML can read them.
+///
+/// Writes the file even when the fetch fails, holding an empty list, so
+/// the overlay stops asking for that chapter on every page turn.
+fn answer_hot(
+    agent: &ureq::Agent,
+    sess: &login::Session,
+    paths: &Paths,
+    book_id: &str,
+    chapter_uid: i64,
+) {
+    let taps = match with_retry("underlines", || {
+        pipeline::hot_for_chapter(agent, &sess.api_key, paths, book_id, chapter_uid)
+    }) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("weread: underlines for chapter {chapter_uid} failed: {e}");
+            Vec::new()
+        }
+    };
+    let dir = paths.exthome.join("hot");
+    if let Err(e) = fs::create_dir_all(&dir) {
+        eprintln!("weread: cannot create hot dir: {e}");
+        return;
+    }
+    let json = serde_json::to_string(&taps).unwrap_or_else(|_| "[]".into());
+    let tmp = dir.join(format!("{book_id}_{chapter_uid}.json.tmp"));
+    let dest = dir.join(format!("{book_id}_{chapter_uid}.json"));
+    if fs::write(&tmp, json).and_then(|_| fs::rename(&tmp, &dest)).is_err() {
+        eprintln!("weread: cannot write hot file for {chapter_uid}");
+        return;
+    }
+    // Bump a sequence so the overlay knows to re-read without polling
+    // the (possibly large) result file itself.
+    write_result("hot.txt", "ok", &[format!("{book_id} {chapter_uid} {}", taps.len())]);
 }
 
 /// Scans for `gen_<bookId>_<nonce>` triggers from the shelf browser.
@@ -242,6 +301,10 @@ fn generate_book_id(
         &book.title,
         &book.author,
         &book.cover,
+        // Zero underline requests during generation: a whole book's
+        // worth in a few minutes is what got this client throttled.
+        // Underlines are fetched per chapter while reading instead.
+        pipeline::HotPolicy::ReuseKnown,
         |note| gen_status("working", note),
     )?;
     let what = match &generated.delivery {
@@ -293,49 +356,6 @@ fn answer_ask(
     write_result("reviews.txt", "ok", &lines);
 }
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Threshold-gated daily refresh for every delivered book.
-fn maybe_refresh(agent: &ureq::Agent, sess: &mut login::Session, paths: &Paths) {
-    let registry_path = paths.registry();
-    let mut reg = xochitl_doc::load_registry(&registry_path);
-    let now = now_secs();
-    let mut dirty = false;
-    let book_ids: Vec<String> = reg.books.keys().cloned().collect();
-    for book_id in book_ids {
-        let due = reg
-            .books
-            .get(&book_id)
-            .map(|d| now.saturating_sub(d.decorations_refreshed_at) >= REFRESH_EVERY_SECS)
-            .unwrap_or(false);
-        if !due {
-            continue;
-        }
-        match pipeline::refresh_decorations(agent, sess, paths, &book_id) {
-            Ok(rebuilt) => {
-                println!(
-                    "weread: decoration refresh for {book_id}: {}",
-                    if rebuilt { "rebuilt" } else { "below threshold, skipped" }
-                );
-            }
-            Err(e) => eprintln!("weread: decoration refresh for {book_id} failed: {e}"),
-        }
-        // Checked (successfully or not) — don't retry until tomorrow.
-        if let Some(d) = reg.books.get_mut(&book_id) {
-            d.decorations_refreshed_at = now;
-            dirty = true;
-        }
-    }
-    if dirty {
-        let _ = xochitl_doc::save_registry(&registry_path, &reg);
-    }
-}
-
 fn main() {
     let paths = Paths::device();
     fs::create_dir_all(&paths.exthome).expect("failed to create weread exthome dir");
@@ -344,6 +364,11 @@ fn main() {
     }
     let _ = take_asks();
     let _ = take_gen_requests();
+    let _ = take_hot_requests();
+    // Underlines are per-reading-session now; a stale set from a
+    // previous run would draw lines for a book that may since have been
+    // regenerated with different geometry.
+    let _ = fs::remove_dir_all(paths.exthome.join("hot"));
     ensure_shelf_card(&paths);
     if !exthome().join("gen.txt").exists() {
         gen_status("done", "(空闲)");
@@ -368,7 +393,6 @@ fn main() {
     };
 
     let mut review_cache: HashMap<(String, i64, String), underlines::RangeReviews> = HashMap::new();
-    let mut last_refresh_check = 0u64;
 
     println!("weread_daemon: watching {} for triggers...", paths.exthome.display());
     loop {
@@ -406,15 +430,12 @@ fn main() {
             }
         }
 
-        for (book_id, chapter_uid, range) in take_asks() {
-            answer_ask(&agent, &sess, &paths, &mut review_cache, book_id, chapter_uid, range);
+        for (book_id, chapter_uid) in take_hot_requests() {
+            answer_hot(&agent, &sess, &paths, &book_id, chapter_uid);
         }
 
-        // Cheap hourly check of the daily refresh clock.
-        let now = now_secs();
-        if now.saturating_sub(last_refresh_check) >= 3600 {
-            last_refresh_check = now;
-            maybe_refresh(&agent, &mut sess, &paths);
+        for (book_id, chapter_uid, range) in take_asks() {
+            answer_ask(&agent, &sess, &paths, &mut review_cache, book_id, chapter_uid, range);
         }
 
         std::thread::sleep(POLL_INTERVAL);
