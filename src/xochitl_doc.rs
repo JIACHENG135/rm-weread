@@ -31,10 +31,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const XOCHITL_DIR: &str = "/home/root/.local/share/remarkable/xochitl";
 pub const REGISTRY_PATH: &str = "/home/root/.local/share/rm-weread/docs.json";
 
+/// Library folder every generated book is delivered into, so they don't
+/// scatter through the user's own documents.
+pub const FOLDER_NAME: &str = "微信读书";
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Registry {
     /// book_id → delivered document.
     pub books: BTreeMap<String, DeliveredDoc>,
+    /// uuid of the `微信读书` collection. Remembered so renaming or
+    /// moving the folder on-device doesn't make us create a second one.
+    #[serde(default)]
+    pub folder_uuid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,25 +112,103 @@ fn has_ink(xochitl_dir: &Path, uuid: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn write_metadata(xochitl_dir: &Path, uuid: &str, visible_name: &str) -> std::io::Result<()> {
+/// Finds or creates the `微信读书` collection and returns its uuid.
+///
+/// Order matters: trust the registry first (the user may have renamed
+/// the folder, and it's still theirs), then look for a folder already
+/// carrying the name (a reinstall that lost `docs.json` must not create
+/// a duplicate), and only then make one. A collection is metadata only
+/// — no `.content`, no payload file.
+fn ensure_folder(xochitl_dir: &Path, reg: &mut Registry) -> std::io::Result<String> {
+    if let Some(uuid) = &reg.folder_uuid
+        && xochitl_dir.join(format!("{uuid}.metadata")).exists()
+    {
+        return Ok(uuid.clone());
+    }
+
+    if let Some(uuid) = find_collection(xochitl_dir, FOLDER_NAME) {
+        reg.folder_uuid = Some(uuid.clone());
+        return Ok(uuid);
+    }
+
+    let uuid = new_uuid();
+    let metadata = serde_json::json!({
+        "visibleName": FOLDER_NAME,
+        "type": "CollectionType",
+        "parent": "",
+        "createdTime": now_ms().to_string(),
+        "lastModified": now_ms().to_string(),
+        "new": false,
+        "pinned": false,
+        "source": "",
+    });
+    fs::write(
+        xochitl_dir.join(format!("{uuid}.metadata")),
+        serde_json::to_string_pretty(&metadata).unwrap(),
+    )?;
+    reg.folder_uuid = Some(uuid.clone());
+    Ok(uuid)
+}
+
+/// Scans the library for a non-deleted collection with this name.
+fn find_collection(xochitl_dir: &Path, name: &str) -> Option<String> {
+    let mut found: Vec<String> = fs::read_dir(xochitl_dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().extension().map(|x| x == "metadata").unwrap_or(false))
+        .filter_map(|e| {
+            let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(e.path()).ok()?).ok()?;
+            let is_match = v.get("type").and_then(|t| t.as_str()) == Some("CollectionType")
+                && v.get("visibleName").and_then(|n| n.as_str()) == Some(name)
+                && v.get("deleted").and_then(|d| d.as_bool()) != Some(true);
+            is_match.then(|| e.path().file_stem()?.to_str().map(str::to_owned))?
+        })
+        .collect();
+    // Deterministic pick if the user somehow has two folders of the
+    // same name, so we don't ping-pong between them run to run.
+    found.sort();
+    found.into_iter().next()
+}
+
+/// Documents delivered before the folder existed carry a "— 微信读书"
+/// suffix that the folder now says for them; drop it so they don't read
+/// as "书名 — 微信读书" sitting inside a folder called 微信读书. Not a
+/// suffix strip: the versioned form is "书名 — 微信读书 (更新版)", so
+/// the marker has to come out of the middle too.
+fn migrated_name(stored: &str) -> String {
+    stored.replace(" — 微信读书", "")
+}
+
+fn write_metadata(xochitl_dir: &Path, uuid: &str, visible_name: &str, parent: &str) -> std::io::Result<()> {
+    let path = xochitl_dir.join(format!("{uuid}.metadata"));
+    // A refresh rewrites this file to nudge xochitl's change detection,
+    // and it must not take the reader's state with it. Reading position
+    // and pinning belong to the user, not to the generator — for the
+    // same reason the freeze rules protect their ink.
+    let old: serde_json::Value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let keep = |key: &str, fallback: serde_json::Value| {
+        old.get(key).cloned().unwrap_or(fallback)
+    };
+
     let metadata = serde_json::json!({
         "visibleName": visible_name,
         "type": "DocumentType",
-        "parent": "",
+        "parent": parent,
         "lastModified": now_ms().to_string(),
-        "lastOpened": "",
-        "lastOpenedPage": 0,
+        "lastOpened": keep("lastOpened", "".into()),
+        "lastOpenedPage": keep("lastOpenedPage", 0.into()),
+        "createdTime": keep("createdTime", now_ms().to_string().into()),
+        "pinned": keep("pinned", false.into()),
         "version": 1,
-        "pinned": false,
         "synced": false,
         "modified": false,
         "deleted": false,
         "metadatamodified": false
     });
-    fs::write(
-        xochitl_dir.join(format!("{uuid}.metadata")),
-        serde_json::to_string_pretty(&metadata).unwrap(),
-    )
+    fs::write(&path, serde_json::to_string_pretty(&metadata).unwrap())
 }
 
 fn write_content_file(xochitl_dir: &Path, uuid: &str, page_count: usize) -> std::io::Result<()> {
@@ -170,7 +256,10 @@ pub fn deliver(
 ) -> Result<Delivery, Box<dyn std::error::Error>> {
     fs::create_dir_all(xochitl_dir)?;
     let mut reg = load_registry(registry_path);
-    let visible_name = format!("{} — 微信读书", layout.title);
+    let folder = ensure_folder(xochitl_dir, &mut reg)?;
+    // Bare title: the folder already says where these came from, so the
+    // old "— 微信读书" suffix would just repeat it in every row.
+    let visible_name = layout.title.clone();
 
     let delivery = match reg.books.get(&layout.book_id) {
         Some(doc) if doc.content_sha256 == layout.content_sha256 => {
@@ -178,14 +267,14 @@ pub fn deliver(
             write_pdf(xochitl_dir, &doc.uuid, pdf)?;
             drop_thumbnails(xochitl_dir, &doc.uuid);
             // Nudge xochitl's change detection.
-            write_metadata(xochitl_dir, &doc.uuid, &doc.visible_name)?;
+            write_metadata(xochitl_dir, &doc.uuid, &migrated_name(&doc.visible_name), &folder)?;
             Delivery::Refreshed { uuid: doc.uuid.clone() }
         }
         Some(doc) if !has_ink(xochitl_dir, &doc.uuid) => {
             // Geometry changed but nothing is anchored to it yet.
             write_pdf(xochitl_dir, &doc.uuid, pdf)?;
             write_content_file(xochitl_dir, &doc.uuid, layout.page_count)?;
-            write_metadata(xochitl_dir, &doc.uuid, &visible_name)?;
+            write_metadata(xochitl_dir, &doc.uuid, &visible_name, &folder)?;
             drop_thumbnails(xochitl_dir, &doc.uuid);
             Delivery::Replaced { uuid: doc.uuid.clone() }
         }
@@ -201,7 +290,7 @@ pub fn deliver(
             };
             write_pdf(xochitl_dir, &uuid, pdf)?;
             write_content_file(xochitl_dir, &uuid, layout.page_count)?;
-            write_metadata(xochitl_dir, &uuid, &name)?;
+            write_metadata(xochitl_dir, &uuid, &name, &folder)?;
             reg.books.insert(
                 layout.book_id.clone(),
                 DeliveredDoc {
@@ -216,9 +305,11 @@ pub fn deliver(
         }
     };
 
-    // Refreshed/Replaced paths: keep the registry's hash current.
+    // Refreshed/Replaced paths: keep the registry's hash current, and
+    // let the migrated name stick so the rename happens exactly once.
     if let Some(doc) = reg.books.get_mut(&layout.book_id) {
         doc.content_sha256 = layout.content_sha256.clone();
+        doc.visible_name = migrated_name(&doc.visible_name);
     }
     save_registry(registry_path, &reg)?;
     Ok(delivery)
@@ -265,6 +356,129 @@ mod tests {
         // uuid is v4-shaped.
         assert_eq!(uuid.len(), 36);
         assert_eq!(&uuid[14..15], "4");
+    }
+
+    fn meta(x: &Path, uuid: &str) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(x.join(format!("{uuid}.metadata"))).unwrap()).unwrap()
+    }
+
+    fn collections(x: &Path) -> Vec<String> {
+        fs::read_dir(x)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().map(|s| s == "metadata").unwrap_or(false))
+            .filter(|e| {
+                let v: serde_json::Value =
+                    serde_json::from_str(&fs::read_to_string(e.path()).unwrap()).unwrap();
+                v["type"] == "CollectionType"
+            })
+            .map(|e| e.path().file_stem().unwrap().to_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn delivery_lands_in_the_weread_folder_under_a_bare_title() {
+        let (x, r) = temp_dirs("folder");
+        let l = layout_for("正文一");
+        let Delivery::Created { uuid } = deliver(&x, &r, &l, b"v1").unwrap() else { panic!() };
+
+        let folders = collections(&x);
+        assert_eq!(folders.len(), 1);
+        assert_eq!(meta(&x, &folders[0])["visibleName"], FOLDER_NAME);
+        assert_eq!(meta(&x, &folders[0])["type"], "CollectionType");
+        // A collection is metadata only — no payload, no .content.
+        assert!(!x.join(format!("{}.content", folders[0])).exists());
+
+        assert_eq!(meta(&x, &uuid)["parent"], folders[0]);
+        // The folder carries "微信读书", so the document must not.
+        assert_eq!(meta(&x, &uuid)["visibleName"], "书名");
+        assert_eq!(load_registry(&r).folder_uuid.unwrap(), folders[0]);
+    }
+
+    #[test]
+    fn an_existing_folder_is_adopted_rather_than_duplicated() {
+        // A reinstall that lost docs.json must not leave the user with
+        // two identically named folders.
+        let (x, r) = temp_dirs("adopt");
+        let existing = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        fs::write(
+            x.join(format!("{existing}.metadata")),
+            serde_json::to_string(&serde_json::json!({
+                "visibleName": FOLDER_NAME, "type": "CollectionType", "parent": "", "deleted": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let l = layout_for("正文一");
+        let Delivery::Created { uuid } = deliver(&x, &r, &l, b"v1").unwrap() else { panic!() };
+        assert_eq!(collections(&x), vec![existing.to_string()]);
+        assert_eq!(meta(&x, &uuid)["parent"], existing);
+    }
+
+    #[test]
+    fn a_deleted_folder_is_not_adopted() {
+        let (x, r) = temp_dirs("deleted-folder");
+        fs::write(
+            x.join("dddddddd-bbbb-4ccc-8ddd-eeeeeeeeeeee.metadata"),
+            serde_json::to_string(&serde_json::json!({
+                "visibleName": FOLDER_NAME, "type": "CollectionType", "parent": "", "deleted": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let l = layout_for("正文一");
+        deliver(&x, &r, &l, b"v1").unwrap();
+        // The tombstone is left alone and a live folder made alongside.
+        assert_eq!(collections(&x).len(), 2);
+        let live = load_registry(&r).folder_uuid.unwrap();
+        assert_ne!(live, "dddddddd-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+    }
+
+    #[test]
+    fn a_legacy_suffixed_name_is_migrated_once_on_refresh() {
+        let (x, r) = temp_dirs("rename");
+        let l = layout_for("正文一");
+        let Delivery::Created { uuid } = deliver(&x, &r, &l, b"v1").unwrap() else { panic!() };
+
+        // Pretend this document predates the folder, in both spellings
+        // the old naming could produce.
+        let mut reg = load_registry(&r);
+        reg.books.get_mut("book9").unwrap().visible_name = "书名 — 微信读书 (更新版)".into();
+        save_registry(&r, &reg).unwrap();
+
+        deliver(&x, &r, &l, b"v2").unwrap();
+        assert_eq!(meta(&x, &uuid)["visibleName"], "书名 (更新版)");
+        assert_eq!(load_registry(&r).books["book9"].visible_name, "书名 (更新版)");
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_readers_place_and_pin() {
+        let (x, r) = temp_dirs("keep-position");
+        let l = layout_for("正文一");
+        let Delivery::Created { uuid } = deliver(&x, &r, &l, b"v1").unwrap() else { panic!() };
+
+        // Simulate the user reading to page 42 and pinning the book.
+        let mut m = meta(&x, &uuid);
+        m["lastOpened"] = "1785026414316".into();
+        m["lastOpenedPage"] = 42.into();
+        m["pinned"] = true.into();
+        let created = m["createdTime"].clone();
+        fs::write(
+            x.join(format!("{uuid}.metadata")),
+            serde_json::to_string_pretty(&m).unwrap(),
+        )
+        .unwrap();
+
+        // A decoration refresh rewrites the metadata; it must not cost
+        // the reader their position.
+        assert_eq!(deliver(&x, &r, &l, b"v2").unwrap(), Delivery::Refreshed { uuid: uuid.clone() });
+        let after = meta(&x, &uuid);
+        assert_eq!(after["lastOpened"], "1785026414316");
+        assert_eq!(after["lastOpenedPage"], 42);
+        assert_eq!(after["pinned"], true);
+        assert_eq!(after["createdTime"], created);
     }
 
     #[test]
