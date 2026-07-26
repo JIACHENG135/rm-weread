@@ -312,13 +312,31 @@ fn generate_book_id(
         Delivery::Refreshed { .. } => "已刷新划线",
         Delivery::Replaced { .. } => "已更新文档",
     };
-    Ok(format!(
-        "{}《{}》: {} 页, {} 处热门划线。如果文档没出现，重启 xochitl 一次。",
+    let message = format!(
+        "{}《{}》: {} 页",
         what,
         book.title,
-        generated.layout.page_count,
-        generated.layout.hot_count()
-    ))
+        generated.layout.page_count
+    );
+
+    // xochitl reads the library once at startup: it keeps no inotify
+    // watch on the document directory (checked against /proc/<pid>/fdinfo
+    // — the directory's inode is not among the watched ones) and exposes
+    // no D-Bus call to rescan; the only sync interface on the bus drives
+    // *cloud* sync, and a forged batchFinished signal provokes no reload.
+    // So a brand-new document genuinely cannot appear without a restart.
+    // Do it here rather than leaving it as a manual step: generation is
+    // something the reader asked for and waited minutes on, and it is
+    // only new documents that need it — an in-place refresh is already
+    // in the library.
+    if matches!(generated.delivery, Delivery::Created { .. }) {
+        gen_status("working", &format!("{message}，正在刷新书库…"));
+        match std::process::Command::new("systemctl").arg("restart").arg("xochitl").status() {
+            Ok(st) if st.success() => {}
+            other => eprintln!("weread: could not restart xochitl to show the new book: {other:?}"),
+        }
+    }
+    Ok(message)
 }
 
 fn answer_ask(
