@@ -20,11 +20,11 @@
 //! afford (noted as a TODO, not a blocker).
 //!
 //! What gets drawn, per page: running chapter title in the top margin,
-//! body lines on the grid, hot underlines (stroke weight/dash mapped
-//! from heat), circled-digit markers ①..⑳ after each hot range (the
-//! tap targets the QML popup hit-tests via layout.json), and a page
-//! number in the bottom margin. Decorations live in the margins or
-//! under the text so they never move the geometry.
+//! body lines on the grid, hot underlines (dashed and gray, weight and
+//! dash density mapped from heat — they are also the tap targets the
+//! QML popup hit-tests via layout.json's `taps`), and a page number in
+//! the bottom margin. Decorations live in the margins or under the text
+//! so they never move the geometry.
 
 use crate::layout::{self, BookLayout, ChapterInput, Grid};
 use flate2::Compression;
@@ -40,25 +40,22 @@ use ttf_parser::{Face, GlyphId};
 /// digits. OFL-licensed, so redistributing it here is fine.
 pub const FONT: &[u8] = include_bytes!("../assets/NotoSansSC-Regular.ttf");
 
-/// Underline stroke tiers by heat. Thresholds are a first guess; they
-/// only affect decoration, never geometry, so tuning them later is a
-/// decoration-refresh, not a new document.
-fn underline_style(count: u32) -> (f32, Option<&'static str>) {
+/// Underline stroke tiers by heat: `(width, dash pattern, gray level)`.
+///
+/// All tiers are dashed and gray rather than solid black — the marks
+/// sit under the reader's own ink and should read as a quiet hint, not
+/// as part of the text. Heat still shows through, in dash density and
+/// weight: hotter is denser and slightly darker. Thresholds only affect
+/// decoration, never geometry, so tuning them later is a decoration
+/// refresh, not a new document.
+fn underline_style(count: u32) -> (f32, &'static str, f32) {
     if count >= 1000 {
-        (1.6, None)
+        (1.0, "[4 2] 0 d", 0.35)
     } else if count >= 100 {
-        (1.1, None)
+        (0.8, "[3 3] 0 d", 0.45)
     } else {
-        (0.7, Some("[3 2] 0 d"))
+        (0.7, "[2 4] 0 d", 0.55)
     }
-}
-
-/// Circled digit for marker `index` (1-based). Only ①..⑳ exist in the
-/// font's subset ranges; layout.rs caps marker numbering to match.
-fn marker_char(index: usize) -> Option<char> {
-    (1..=layout::MAX_MARKERS_PER_CHAPTER)
-        .contains(&index)
-        .then(|| char::from_u32(0x2460 + (index as u32 - 1)).unwrap())
 }
 
 struct FontInfo<'a> {
@@ -123,7 +120,7 @@ fn line_tj(font: &FontInfo, text: &str, used: &mut BTreeMap<u16, char>) -> Strin
     tj
 }
 
-/// A single positioned string (headers, footers, markers): no grid, no
+/// A single positioned string (headers, footers): no grid, no
 /// kerning games — natural advances are fine for decorations.
 fn show_text_at(
     font: &FontInfo,
@@ -161,7 +158,7 @@ fn page_content(
     page_local: usize,
     page_abs: usize,
     page_total: usize,
-    hot_with_markers: &[(usize, &layout::HotInput, Option<(usize, usize, usize)>)],
+    hot: &[layout::Hot],
 ) -> Vec<u8> {
     let page = &chapter.pages[page_local];
     let mut s = String::new();
@@ -192,22 +189,19 @@ fn page_content(
     ));
 
     // Hot underlines, drawn *before* the text so ink sits on top.
-    for (_, hot, _) in hot_with_markers {
-        let (width, dash) = underline_style(hot.count);
-        for seg in layout::underline_segments(&chapter.pages, hot.off, hot.len) {
+    for h in hot {
+        let (width, dash, gray) = underline_style(h.count);
+        for seg in layout::underline_segments(&chapter.pages, h.off, h.len) {
             if seg.page != page_local {
                 continue;
             }
             let y = layout::PAGE_H_PT - grid.baseline_pt(seg.row) - 3.0;
             let x0 = grid.col_x_pt(seg.col_start);
             let x1 = grid.col_x_pt(seg.col_end);
-            s.push_str("q 0 G ");
-            let _ = write!(s, "{width:.2} w ");
-            if let Some(d) = dash {
-                s.push_str(d);
-                s.push(' ');
-            }
-            let _ = writeln!(s, "{x0:.2} {y:.2} m {x1:.2} {y:.2} l S Q");
+            let _ = writeln!(
+                s,
+                "q {gray:.2} G {width:.2} w {dash} {x0:.2} {y:.2} m {x1:.2} {y:.2} l S Q"
+            );
         }
     }
 
@@ -223,19 +217,6 @@ fn page_content(
         let _ = writeln!(s, "1 0 0 1 {:.2} {y:.2} Tm {}", grid.margin_x_pt, line_tj(font, line, used));
     }
     s.push_str("ET\n");
-
-    // Circled-digit markers after their range's last column.
-    for (index, _, marker_pos) in hot_with_markers {
-        let Some((m_page, row, col_end)) = marker_pos else { continue };
-        if *m_page != page_local {
-            continue;
-        }
-        let Some(c) = marker_char(*index) else { continue };
-        let size = grid.font_pt * 0.66;
-        let x = grid.col_x_pt(*col_end.min(&grid.cols)) + 1.0;
-        let y = layout::PAGE_H_PT - grid.baseline_pt(*row) + grid.font_pt * 0.18;
-        s.push_str(&show_text_at(font, used, size, x, y, 0.2, &c.to_string()));
-    }
 
     s.into_bytes()
 }
@@ -337,26 +318,10 @@ pub fn generate_with_font(
     let mut used: BTreeMap<u16, char> = BTreeMap::new();
     let mut page_cursor = 0usize;
     for (ci, chapter) in chapters.iter().enumerate() {
+        // Draw straight from the frozen layout's hot list: it already
+        // carries range/off/len/count in a deterministic order, which
+        // is what byte-identical output for the same inputs depends on.
         let clay = &book.chapters[ci];
-        // Marker positions come from the frozen layout: index within
-        // the chapter plus the last underline segment's end.
-        let hot_with_markers: Vec<(usize, &layout::HotInput, Option<(usize, usize, usize)>)> = clay
-            .hot
-            .iter()
-            .map(|h| {
-                let input = chapter
-                    .hot
-                    .iter()
-                    .find(|hi| hi.range == h.range)
-                    .expect("layout built from these chapters");
-                let pos = h.marker.as_ref().map(|_| {
-                    let segs = layout::underline_segments(&chapter.pages, h.off, h.len);
-                    let last = segs.last().expect("marker implies segments");
-                    (last.page, last.row, last.col_end)
-                });
-                (h.marker.as_ref().map(|m| m.index).unwrap_or(0), input, pos)
-            })
-            .collect();
 
         for (pi, _) in chapter.pages.iter().enumerate() {
             let (page_id, content_id) = page_ids[page_cursor];
@@ -369,7 +334,7 @@ pub fn generate_with_font(
                 pi,
                 page_cursor,
                 total_pages,
-                &hot_with_markers,
+                &clay.hot,
             );
             pdf.set(content_id, Pdf::stream("", flate(&content)));
             pdf.set(

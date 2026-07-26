@@ -20,26 +20,34 @@ IMPORT net.asivery.CommandExecutor 1.0
         // Two interactions:
         //  1. Four-finger tap -> touch `generate`, show progress from
         //     gen.txt while the daemon builds/refreshes the PDF.
-        //  2. Tap on a circled marker (①..⑳ burned into the PDF) ->
-        //     hit-test against layout.json's marker boxes, touch
+        //  2. Touch the underlined words themselves -> hit-test against
+        //     layout.json's `taps` boxes, touch
         //     `ask_<chapterUid>_<range>_<nonce>`, poll reviews.txt,
-        //     show the popup. Taps that miss every marker pass through
-        //     untouched (mouse.accepted = false), so page turns behave
-        //     exactly as before on pages without markers.
+        //     show the popup. Taps that miss every underline pass
+        //     through untouched (mouse.accepted = false), so page turns
+        //     behave exactly as before on the rest of the page.
+        //     There is no marker glyph: the dashed underline is its own
+        //     affordance, which is also what removed the old ①..⑳ cap
+        //     that left most underlines untappable.
         //
-        // ── ON-DEVICE TODO (the one open question of this design) ──
-        // Marker hit-testing needs the CURRENT PDF PAGE (0-based) and
-        // ideally the view transform (zoom/pan). Both almost certainly
-        // exist somewhere on this documentview QML context; the names
-        // must be found on a real device by dumping the documentview/
-        // QML via qt-resource-rebuilder and reading what SceneView /
-        // its parents expose (or logging parent-chain property names
-        // from here). Until then `weReadCurrentPage()` returns -1 and
-        // marker taps are DISABLED — reading and generation work, the
-        // popup doesn't fire. Wire it up by replacing the body of
-        // weReadCurrentPage() below. v1 also assumes an unzoomed page
-        // (3:4 PDF fills the 3:4 screen 1:1); zoom support needs the
-        // transform from the same dump.
+        // ── How we get the current page (was this design's one open
+        // question; answered on a real Paper Pro, 3.27.3.0) ──
+        // `touchArea.view` is the SceneView. It hands us everything
+        // hit-testing needs, so nothing has to be inferred:
+        //   view.page            0-based index of the page on screen
+        //   view.pageBorderRect  that page's on-screen rect, in
+        //                        touchArea's own coordinate space
+        //   view.document.id     xochitl uuid of the open document
+        // Using pageBorderRect instead of assuming "3:4 PDF fills the
+        // 3:4 screen 1:1" means zoom and pan work for free — the rect
+        // already accounts for both. Gating on document.id against
+        // layout.json's doc_uuid means tap boxes can never fire in
+        // somebody else's document.
+        // These names were found by walking the parent chain from here
+        // and logging property names under `xovi/debug`; there is no
+        // QML on disk to read (it lives in xochitl's qrc), so runtime
+        // introspection is the way to re-derive them after a firmware
+        // bump.
 
         TouchAreaClickFilter {
             id: weReadGenerateFilter
@@ -68,6 +76,11 @@ IMPORT net.asivery.CommandExecutor 1.0
             id: weReadIpc
             visible: false
             property var layoutData: null
+            // layout.json is a few hundred KB and JSON.parse blocks the
+            // UI thread, so parse it lazily and at most once per run —
+            // without this a missing/unreadable file would re-parse on
+            // every single tap.
+            property bool layoutTried: false
 
             function readFile(name) {
                 var xhr = new XMLHttpRequest();
@@ -86,53 +99,97 @@ IMPORT net.asivery.CommandExecutor 1.0
             }
 
             function loadLayout() {
+                layoutTried = true;
                 var raw = readFile("layout.json");
                 if (!raw) { layoutData = null; return; }
                 try { layoutData = JSON.parse(raw); } catch (e) { layoutData = null; }
             }
 
-            // ON-DEVICE TODO (see header comment): return the 0-based
-            // page of the PDF currently on screen, or -1 when unknown.
-            function currentPage() {
-                return -1;
+            // xochitl uuid of the document currently open, "" if none.
+            function openDocId() {
+                try {
+                    var d = touchArea.view.document;
+                    return d ? ("" + d.id) : "";
+                } catch (e) {
+                    return "";
+                }
             }
 
-            // Nearest marker on `page` whose expanded box contains the
-            // normalized tap point, or null.
-            function hitMarker(page, nx, ny) {
-                if (!layoutData || !layoutData.markers) return null;
-                var sx = 44.0 / 702.0 / 2.0, sy = 44.0 / 936.0 / 2.0;
+            // 0-based page of the PDF currently on screen, or -1 when
+            // the open document isn't the book layout.json describes
+            // (so taps in every other document pass straight through).
+            function currentPage() {
+                if (!layoutData || !layoutData.doc_uuid) return -1;
+                if (openDocId() !== layoutData.doc_uuid) return -1;
+                try {
+                    var p = touchArea.view.page;
+                    return (typeof p === "number" && p >= 0) ? p : -1;
+                } catch (e) {
+                    return -1;
+                }
+            }
+
+            // Tap point in normalized page coordinates (0..1, top-left
+            // origin — the same frame layout.json's tap boxes use),
+            // or null when the tap landed off the page. pageBorderRect
+            // is the page's on-screen rect, so this stays correct while
+            // zoomed or panned.
+            function pagePoint(mx, my) {
+                var r;
+                try {
+                    r = touchArea.view.pageBorderRect;
+                } catch (e) {
+                    return null;
+                }
+                if (!r || !(r.width > 0) || !(r.height > 0)) return null;
+                var nx = (mx - r.x) / r.width;
+                var ny = (my - r.y) / r.height;
+                if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return null;
+                return Qt.point(nx, ny);
+            }
+
+            // The underlined run on `page` under the normalized tap
+            // point, or null. Boxes are already sized to the glyphs
+            // they cover (layout.rs `tap_box`, which also adds the
+            // downward slop), so no expansion happens here — a tap on
+            // plain text must stay a page turn. Overlaps are expected
+            // where a range wraps onto the next row, so the nearest
+            // centre wins.
+            function hitTap(page, nx, ny) {
+                if (!layoutData || !layoutData.taps) return null;
                 var best = null, bestDist = 1e9;
-                for (var i = 0; i < layoutData.markers.length; i++) {
-                    var m = layoutData.markers[i];
-                    if (m.page !== page) continue;
-                    if (nx < m.x0 - sx || nx > m.x1 + sx || ny < m.y0 - sy || ny > m.y1 + sy) continue;
-                    var d = Math.abs(nx - (m.x0 + m.x1) / 2) + Math.abs(ny - (m.y0 + m.y1) / 2);
-                    if (d < bestDist) { bestDist = d; best = m; }
+                for (var i = 0; i < layoutData.taps.length; i++) {
+                    var t = layoutData.taps[i];
+                    if (t.page !== page) continue;
+                    if (nx < t.x0 || nx > t.x1 || ny < t.y0 || ny > t.y1) continue;
+                    var d = Math.abs(nx - (t.x0 + t.x1) / 2) + Math.abs(ny - (t.y0 + t.y1) / 2);
+                    if (d < bestDist) { bestDist = d; best = t; }
                 }
                 return best;
             }
         }
 
         MouseArea {
-            id: weReadMarkerTap
+            id: weReadUnderlineTap
             anchors.fill: parent
             z: 900
             propagateComposedEvents: true
             visible: !weReadPopup.visible
             onPressed: (mouse) => {
+                if (!weReadIpc.layoutData && !weReadIpc.layoutTried) weReadIpc.loadLayout();
                 var page = weReadIpc.currentPage();
                 if (page < 0) { mouse.accepted = false; return; }
-                if (!weReadIpc.layoutData) weReadIpc.loadLayout();
-                var m = weReadIpc.hitMarker(page, mouse.x / width, mouse.y / height);
-                if (!m) { mouse.accepted = false; return; }
+                var pt = weReadIpc.pagePoint(mouse.x, mouse.y);
+                if (!pt) { mouse.accepted = false; return; }
+                var t = weReadIpc.hitTap(page, pt.x, pt.y);
+                if (!t) { mouse.accepted = false; return; }
                 mouse.accepted = true;
                 weReadPopup.quote = "";
                 weReadPopup.reviewsText = "正在加载评论…";
                 weReadPopup.visible = true;
                 weReadPopup.lastSeq = weReadIpc.readSeq("reviews.txt");
                 weReadCmd.executeCommand("/bin/touch", [
-                    "/home/root/xovi/exthome/weread/ask_" + m.chapter_uid + "_" + m.range + "_" + Date.now()
+                    "/home/root/xovi/exthome/weread/ask_" + t.chapter_uid + "_" + t.range + "_" + Date.now()
                 ]);
                 weReadReviewPoller.start();
             }

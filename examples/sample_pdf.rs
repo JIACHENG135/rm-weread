@@ -47,10 +47,11 @@ fn main() {
     let pdf = pdfgen::generate(&layout, &chapters).expect("generate");
     std::fs::write("target/sample.pdf", &pdf).expect("write");
     println!(
-        "target/sample.pdf: {} bytes, {} pages, {} markers",
+        "target/sample.pdf: {} bytes, {} pages, {} underlines, {} tap targets",
         pdf.len(),
         layout.page_count,
-        layout.markers.len()
+        layout.hot_count(),
+        layout.taps.len()
     );
     println!("layout.json: {} bytes", serde_json::to_string(&layout).unwrap().len());
 }

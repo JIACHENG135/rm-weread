@@ -158,7 +158,7 @@ fn generate_first_shelf_book(
         what,
         book.title,
         generated.layout.page_count,
-        generated.layout.markers.len()
+        generated.layout.hot_count()
     ))
 }
 

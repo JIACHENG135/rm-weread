@@ -7,8 +7,9 @@
 //! column model), so a line's box is fully derived from its row index
 //! and the grid constants. What must be *stored* is only what can't be
 //! recomputed cheaply at query time: each line's character offset, and
-//! each hot underline's marker bounding box (which the QML popup
-//! hit-tests against).
+//! a box around every underlined run (which the QML popup hit-tests
+//! against — touching the underlined words is what opens the reviews,
+//! so the underline is its own affordance and there is no marker glyph).
 //!
 //! Coordinates in this file are normalized to 0..1 with a **top-left
 //! origin** — the convention touch events arrive in on the QML side.
@@ -117,22 +118,6 @@ pub struct Hot {
     pub off: usize,
     pub len: usize,
     pub count: u32,
-    /// Absent when the chapter ran out of marker glyphs (①..⑳): the
-    /// underline is still drawn, it just isn't tappable.
-    pub marker: Option<Marker>,
-}
-
-/// A tappable marker's bounding box, normalized, top-left origin.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Marker {
-    pub page: usize,
-    pub x0: f32,
-    pub y0: f32,
-    pub x1: f32,
-    pub y1: f32,
-    /// 1-based index within the chapter — which circled digit (①=1)
-    /// was drawn.
-    pub index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -146,11 +131,16 @@ pub struct ChapterLayout {
     pub hot: Vec<Hot>,
 }
 
-/// Flattened, QML-friendly view of every tappable marker in the book.
-/// The popup reads layout.json directly (XHR) and hit-tests taps
-/// against these boxes without needing the per-chapter structure.
+/// Flattened, QML-friendly view of every tappable region in the book:
+/// one entry per underlined run on one line, boxed around the *glyphs*
+/// so the reader taps the underlined words themselves. The popup reads
+/// layout.json directly (XHR) and hit-tests taps against these without
+/// needing the per-chapter structure.
+///
+/// A range that wraps across lines or pages contributes several taps
+/// sharing the same `range` — each one opens the same reviews.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MarkerRef {
+pub struct Tap {
     pub page: usize,
     pub x0: f32,
     pub y0: f32,
@@ -176,7 +166,7 @@ pub struct BookLayout {
     pub grid: Grid,
     pub page_count: usize,
     pub chapters: Vec<ChapterLayout>,
-    pub markers: Vec<MarkerRef>,
+    pub taps: Vec<Tap>,
 }
 
 /// Per-chapter input to `build`: the paginated text plus the hot
@@ -265,8 +255,12 @@ pub fn content_hash(chapters: &[ChapterInput], grid: &Grid) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// How many circled-digit glyphs we have for markers (①..⑳, U+2460..).
-pub const MAX_MARKERS_PER_CHAPTER: usize = 20;
+/// How far below its line box a tap still counts as hitting the run,
+/// as a fraction of the line height. The rule is stroked just under the
+/// baseline, near the bottom of the box, and fingers land low — without
+/// a little slack the most natural gesture (touch the line itself)
+/// falls into the gap between rows.
+const TAP_SLOP_BELOW: f32 = 0.3;
 
 /// Builds the frozen layout for a whole book. Chapter order is PDF
 /// order; each chapter starts on a fresh page.
@@ -279,7 +273,7 @@ pub fn build(
 ) -> BookLayout {
     let content_sha256 = content_hash(chapters, &grid);
     let mut out_chapters = Vec::new();
-    let mut markers = Vec::new();
+    let mut taps = Vec::new();
     let mut page_cursor = 0usize;
 
     for c in chapters {
@@ -296,35 +290,30 @@ pub fn build(
         }
 
         let mut hot_out = Vec::new();
-        // Deterministic marker numbering: by text position, not by
-        // whatever order the API returned.
+        // Deterministic order: by text position, not by whatever order
+        // the API returned — `taps` is part of the frozen artifact.
         let mut hot_sorted: Vec<&HotInput> = c.hot.iter().collect();
         hot_sorted.sort_by_key(|h| (h.off, h.len));
-        let mut marker_index = 0usize;
         for h in hot_sorted {
-            let segs = underline_segments(&c.pages, h.off, h.len);
-            let marker = segs.last().filter(|_| marker_index < MAX_MARKERS_PER_CHAPTER).map(|last| {
-                marker_index += 1;
-                marker_box(&grid, page_cursor + last.page, last.row, last.col_end, marker_index)
-            });
-            if let Some(m) = &marker {
-                markers.push(MarkerRef {
-                    page: m.page,
-                    x0: m.x0,
-                    y0: m.y0,
-                    x1: m.x1,
-                    y1: m.y1,
-                    chapter_uid: c.chapter_uid,
-                    range: h.range.clone(),
-                    count: h.count,
-                });
+            // Every underlined run is its own tap target; a range that
+            // wraps just yields several boxes with the same `range`.
+            for seg in underline_segments(&c.pages, h.off, h.len) {
+                taps.push(tap_box(
+                    &grid,
+                    page_cursor + seg.page,
+                    seg.row,
+                    seg.col_start,
+                    seg.col_end,
+                    c.chapter_uid,
+                    &h.range,
+                    h.count,
+                ));
             }
             hot_out.push(Hot {
                 range: h.range.clone(),
                 off: h.off,
                 len: h.len,
                 count: h.count,
-                marker,
             });
         }
 
@@ -340,7 +329,9 @@ pub fn build(
     }
 
     BookLayout {
-        v: 1,
+        // v2: tappable underline runs (`taps`) replaced the circled-digit
+        // markers of v1. The QML popup reads this field name directly.
+        v: 2,
         book_id: book_id.to_string(),
         title: title.to_string(),
         author: author.to_string(),
@@ -351,35 +342,54 @@ pub fn build(
         grid,
         page_count: page_cursor,
         chapters: out_chapters,
-        markers,
+        taps,
     }
 }
 
-/// The marker glyph is drawn 2 columns wide right after the underline's
-/// last column (spilling into the right margin when the line is full —
-/// the margins are wide enough for one glyph).
-fn marker_box(grid: &Grid, page: usize, row: usize, col_end: usize, index: usize) -> Marker {
-    let x0 = grid.col_x_pt(col_end.min(grid.cols)) / PAGE_W_PT;
-    let x1 = (grid.col_x_pt(col_end.min(grid.cols)) + 2.0 * grid.col_pt()) / PAGE_W_PT;
-    let y0 = grid.line_top_pt(row) / PAGE_H_PT;
-    let y1 = (grid.line_top_pt(row) + grid.line_pt()) / PAGE_H_PT;
-    Marker { page, x0, y0, x1, y1, index }
+/// Box around one underlined run: exactly the columns the run covers,
+/// and its line box vertically, extended a little downward (see
+/// `TAP_SLOP_BELOW`). Normalized, top-left origin.
+#[allow(clippy::too_many_arguments)]
+fn tap_box(
+    grid: &Grid,
+    page: usize,
+    row: usize,
+    col_start: usize,
+    col_end: usize,
+    chapter_uid: i64,
+    range: &str,
+    count: u32,
+) -> Tap {
+    let top = grid.line_top_pt(row);
+    Tap {
+        page,
+        x0: grid.col_x_pt(col_start) / PAGE_W_PT,
+        x1: grid.col_x_pt(col_end.min(grid.cols)) / PAGE_W_PT,
+        y0: top / PAGE_H_PT,
+        y1: (top + grid.line_pt() * (1.0 + TAP_SLOP_BELOW)) / PAGE_H_PT,
+        chapter_uid,
+        range: range.to_string(),
+        count,
+    }
 }
 
 impl BookLayout {
+    /// How many hot underlines the book has. Not `taps.len()`: a range
+    /// that wraps across lines contributes one tap box per line, so
+    /// that number is always the larger one.
+    pub fn hot_count(&self) -> usize {
+        self.chapters.iter().map(|c| c.hot.len()).sum()
+    }
+
     /// Hit-tests a tap (normalized, top-left origin) against the
-    /// markers on `page`, with the bounding box expanded to a
-    /// comfortable touch target. Returns the nearest hit.
-    pub fn hit_marker(&self, page: usize, x: f32, y: f32) -> Option<&MarkerRef> {
-        // 44pt expanded target, normalized per axis.
-        let sx = 44.0 / PAGE_W_PT / 2.0;
-        let sy = 44.0 / PAGE_H_PT / 2.0;
-        self.markers
+    /// underlined runs on `page`. Boxes overlap by design — a wrapped
+    /// range stacks on consecutive rows, and `TAP_SLOP_BELOW` lets each
+    /// row reach into the next — so ties go to the nearest centre.
+    pub fn hit_tap(&self, page: usize, x: f32, y: f32) -> Option<&Tap> {
+        self.taps
             .iter()
-            .filter(|m| m.page == page)
-            .filter(|m| {
-                x >= m.x0 - sx && x <= m.x1 + sx && y >= m.y0 - sy && y <= m.y1 + sy
-            })
+            .filter(|t| t.page == page)
+            .filter(|t| x >= t.x0 && x <= t.x1 && y >= t.y0 && y <= t.y1)
             .min_by(|a, b| {
                 let da = (x - (a.x0 + a.x1) / 2.0).abs() + (y - (a.y0 + a.y1) / 2.0).abs();
                 let db = (x - (b.x0 + b.x1) / 2.0).abs() + (y - (b.y0 + b.y1) / 2.0).abs();
@@ -447,37 +457,70 @@ mod tests {
     }
 
     #[test]
-    fn markers_are_numbered_by_text_order_and_hit_testable() {
+    fn taps_follow_text_order_and_are_hit_testable() {
         let grid = Grid { cols: 6, lines_per_page: 2, ..Grid::default() };
         let text = "一二三四五六七八九十";
         let c = ChapterInput {
             pages: paginate(text, grid.cols, grid.lines_per_page),
-            ..chapter(1, text, vec![hot("30-40", 6, 2, 500), hot("10-20", 0, 2, 100)])
+            // CJK is 2 columns wide, so cols:6 holds 3 chars per line
+            // and a page holds 6 — both underlines have to start inside
+            // that first page for this to be about ordering rather than
+            // about the per-page numbering reset.
+            ..chapter(1, text, vec![hot("30-40", 2, 2, 500), hot("10-20", 0, 2, 100)])
         };
         let l = build("b", "t", "a", &[c], grid);
         // Sorted by offset: "10-20" gets ①, "30-40" gets ②.
         assert_eq!(l.chapters[0].hot[0].range, "10-20");
-        assert_eq!(l.chapters[0].hot[0].marker.as_ref().unwrap().index, 1);
-        assert_eq!(l.chapters[0].hot[1].marker.as_ref().unwrap().index, 2);
-        // Hit-testing the first marker's centre finds it.
-        let m = &l.markers[0];
-        let hit = l.hit_marker(m.page, (m.x0 + m.x1) / 2.0, (m.y0 + m.y1) / 2.0).unwrap();
+        // Tapping the underlined glyphs themselves opens that range.
+        let t = &l.taps[0];
+        assert_eq!(t.range, "10-20");
+        let hit = l.hit_tap(t.page, (t.x0 + t.x1) / 2.0, (t.y0 + t.y1) / 2.0).unwrap();
         assert_eq!(hit.range, "10-20");
         // A tap on a different page misses.
-        assert!(l.hit_marker(m.page + 7, (m.x0 + m.x1) / 2.0, (m.y0 + m.y1) / 2.0).is_none());
+        assert!(l.hit_tap(t.page + 7, (t.x0 + t.x1) / 2.0, (t.y0 + t.y1) / 2.0).is_none());
+        // So does one in the margin, left of the text column.
+        assert!(l.hit_tap(t.page, 0.01, (t.y0 + t.y1) / 2.0).is_none());
     }
 
     #[test]
-    fn marker_cap_leaves_underline_but_no_marker() {
+    fn a_wrapped_range_yields_one_tap_per_line_sharing_the_range() {
+        // cols:6 with 2-column CJK holds 3 chars per line, so a 4-char
+        // underline starting mid-line necessarily wraps.
         let grid = Grid { cols: 6, lines_per_page: 2, ..Grid::default() };
-        let text: String = "一二三四五六七八九十".repeat(10);
-        let hots: Vec<HotInput> = (0..25).map(|i| hot(&format!("r{i}"), i * 4, 2, 10)).collect();
+        let text = "一二三四五六";
+        let c = ChapterInput {
+            pages: paginate(text, grid.cols, grid.lines_per_page),
+            ..chapter(1, text, vec![hot("7-8", 2, 3, 42)])
+        };
+        let l = build("b", "t", "a", &[c], grid);
+        assert!(l.taps.len() > 1, "expected the range to wrap");
+        assert!(l.taps.iter().all(|t| t.range == "7-8" && t.count == 42));
+        // Each line's box is tappable and resolves to the same range.
+        for t in &l.taps {
+            let hit = l.hit_tap(t.page, (t.x0 + t.x1) / 2.0, (t.y0 + t.y1) / 2.0).unwrap();
+            assert_eq!(hit.range, "7-8");
+        }
+    }
+
+    #[test]
+    fn every_underline_is_tappable_however_dense_the_chapter() {
+        // The regression this replaced marker glyphs to fix: circled
+        // digits capped a chapter at 20 tap targets, so a real book
+        // (《球状闪电》: 840 hot underlines, 151 in one chapter) left
+        // 62% of its underlines dead. Nothing is capped now.
+        let grid = Grid { cols: 60, lines_per_page: 20, ..Grid::default() };
+        let text: String = "一二三四五六七八九十".repeat(100);
+        let hots: Vec<HotInput> = (0..151).map(|i| hot(&format!("r{i}"), i * 4, 2, 10)).collect();
         let c = ChapterInput { pages: paginate(&text, grid.cols, grid.lines_per_page), ..chapter(1, &text, hots) };
         let l = build("b", "t", "a", &[c], grid);
-        let with_marker = l.chapters[0].hot.iter().filter(|h| h.marker.is_some()).count();
-        assert_eq!(with_marker, MAX_MARKERS_PER_CHAPTER);
-        assert_eq!(l.markers.len(), MAX_MARKERS_PER_CHAPTER);
-        assert_eq!(l.chapters[0].hot.len(), 25);
+
+        assert_eq!(l.chapters[0].hot.len(), 151);
+        let ranges: std::collections::BTreeSet<&str> = l.taps.iter().map(|t| t.range.as_str()).collect();
+        assert_eq!(ranges.len(), 151, "every range must have at least one tap target");
+        // And each one is actually reachable at its own centre.
+        for t in &l.taps {
+            assert!(l.hit_tap(t.page, (t.x0 + t.x1) / 2.0, (t.y0 + t.y1) / 2.0).is_some());
+        }
     }
 
     #[test]

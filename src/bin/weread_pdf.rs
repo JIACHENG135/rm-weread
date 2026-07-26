@@ -60,10 +60,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     session::save(&path, &sess)?;
 
     println!(
-        "delivered: {:?}\npages: {}, markers: {}\nPDF + metadata in {}\nlayout.json in {}",
+        "delivered: {:?}\npages: {}, underlines: {}, tap targets: {}\nPDF + metadata in {}\nlayout.json in {}",
         generated.delivery,
         generated.layout.page_count,
-        generated.layout.markers.len(),
+        generated.layout.hot_count(),
+        generated.layout.taps.len(),
         paths.xochitl_dir.display(),
         paths.exthome.display(),
     );
