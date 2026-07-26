@@ -112,7 +112,6 @@ IMPORT net.asivery.CommandExecutor 1.0
             // one chapter at a time, when you actually reach it.
             property var hotByChapter: ({})
             property var hotAsked: ({})
-            property int hotSeq: 0
 
             // Chapter covering an absolute page, or null.
             function chapterAt(page) {
@@ -158,7 +157,16 @@ IMPORT net.asivery.CommandExecutor 1.0
                     "/home/root/xovi/exthome/weread/hot_" + l.book_id + "_" + c.chapter_uid
                         + "_" + Date.now()
                 ]);
-                weReadHotPoller.restart();
+                weReadHotPoller.running = true;
+            }
+
+            // Chapters asked for whose result hasn't been read yet.
+            function pendingChapters() {
+                var out = [];
+                for (var key in hotAsked) {
+                    if (!hotByChapter[key]) out.push(key);
+                }
+                return out;
             }
 
             function loadHot(bookId, chapterUid) {
@@ -307,9 +315,16 @@ IMPORT net.asivery.CommandExecutor 1.0
             }
         }
 
-        // Shared look. Greys are Apple's system label/separator ramp,
-        // which is what makes this read as a native macOS popover
-        // rather than a generic dialog. No colour: this is e-ink.
+        // Shared look: macOS popover structure, but the greys are tuned
+        // for e-ink, not borrowed from it.
+        //
+        // The first version used Apple's system label ramp verbatim
+        // (#3A3A3C body, #8E8E93 secondary). Those are calibrated for a
+        // backlit LCD; on a reflective 16-grey display with no backlight
+        // they wash out and the review text was hard to read. Body text
+        // now sits near black — the same weight the page itself prints
+        // at — and the separators had to come *up* in contrast too, or
+        // they vanish entirely.
         //
         // Deliberately NO font.bold anywhere. The shipped NotoSansSC is
         // a variable font, and synthesising bold from it renders thinner
@@ -319,14 +334,14 @@ IMPORT net.asivery.CommandExecutor 1.0
         Item {
             id: weReadStyle
             visible: false
-            readonly property color ink: "#1D1D1F"
-            readonly property color inkSoft: "#3A3A3C"
-            readonly property color inkMuted: "#8E8E93"
-            readonly property color hairline: "#E5E5EA"
-            readonly property color fill: "#F2F2F7"
+            readonly property color ink: "#000000"
+            readonly property color inkSoft: "#111111"
+            readonly property color inkMuted: "#4A4A4A"
+            readonly property color hairline: "#AFAFAF"
+            readonly property color fill: "#ECECEC"
             readonly property color surface: "#FFFFFF"
-            readonly property color edge: "#C6C6C8"
-            readonly property color rim: "#D8D8DC"
+            readonly property color edge: "#6E6E6E"
+            readonly property color rim: "#9A9A9A"
             readonly property int radius: 20
             readonly property int pad: 28
         }
@@ -378,8 +393,7 @@ IMPORT net.asivery.CommandExecutor 1.0
                 visible = false;
                 weReadShelfPoller.stop();
                 weReadStatus.lastSeq = weReadIpc.readSeq("gen.txt");
-                weReadStatus.message = "正在生成《" + book.title + "》…";
-                weReadStatus.visible = true;
+                weReadStatus.reset("正在生成《" + book.title + "》…");
                 weReadCmd.executeCommand("/bin/touch", [
                     "/home/root/xovi/exthome/weread/gen_" + book.book_id + "_" + Date.now()
                 ]);
@@ -700,106 +714,219 @@ IMPORT net.asivery.CommandExecutor 1.0
             }
         }
 
+        // Polls for outstanding chapter fetches by simply trying to read
+        // each pending chapter's file — deliberately not driven by a
+        // sequence number in hot.txt. That coupling had a hole: the
+        // poller stopped after handling one notification, and since a
+        // page turn inside an already-requested chapter issues no new
+        // request, nothing ever restarted it. A second chapter's result
+        // then sat on disk unread — 560 underlines fetched and none
+        // drawn. Here the poller runs exactly while work is outstanding.
         Timer {
             id: weReadHotPoller
             interval: 700
             repeat: true
+            running: false
             property int elapsedMs: 0
             onTriggered: {
-                elapsedMs += interval;
-                var lines = weReadIpc.readFile("hot.txt").split("\n");
-                var seq = parseInt(lines[0]);
-                if (!isNaN(seq) && seq > weReadIpc.hotSeq) {
-                    weReadIpc.hotSeq = seq;
-                    var parts = (lines.length > 2 ? lines[2] : "").split(" ");
-                    if (parts.length >= 2 && weReadIpc.loadHot(parts[0], parts[1])) {
-                        weReadOverlay.rebuild();
-                    }
+                var l = weReadIpc.layoutData;
+                var pending = weReadIpc.pendingChapters();
+                if (!l || !l.book_id || pending.length === 0) {
                     elapsedMs = 0;
-                    stop();
+                    running = false;
                     return;
                 }
-                if (elapsedMs > 30000) { elapsedMs = 0; stop(); }
+                elapsedMs += interval;
+                var loaded = false;
+                for (var i = 0; i < pending.length; i++) {
+                    if (weReadIpc.loadHot(l.book_id, pending[i])) loaded = true;
+                }
+                if (loaded) {
+                    elapsedMs = 0;
+                    weReadOverlay.rebuild();
+                }
+                // A chapter whose fetch failed gets an empty file, so
+                // this only fires if the daemon never answered at all.
+                if (elapsedMs > 60000) {
+                    elapsedMs = 0;
+                    running = false;
+                }
             }
         }
 
+        // Generation progress, macOS sheet in structure — but a
+        // *determinate* bar, not a spinner.
+        //
+        // NSProgressIndicator's spinner needs tens of repaints a second.
+        // On e-ink every repaint is a panel refresh: it would flicker,
+        // ghost, and cost more than the work it reports on. The daemon
+        // already emits "章节 12/288", so there is real progress to
+        // show, and the bar only moves when a chapter completes — about
+        // once a second — which is exactly one refresh per step.
         Item {
             id: weReadStatus
             visible: false
             z: 1500
-            width: Math.min(parent.width * 0.72, 660)
-            height: weReadStatusText.implicitHeight + 40
+            width: Math.min(parent.width * 0.78, 720)
+            height: weReadStatusBody.implicitHeight + 2 * weReadStyle.pad
             anchors.horizontalCenter: parent.horizontalCenter
-            y: 28
+            y: 40
+
             property int lastSeq: 0
             property string message: ""
+            // "working" | "done" | "done_restart" | "error"
+            property string phase: "working"
+            property int step: 0
+            property int steps: 0
+            property string detail: ""
+
+            function reset(msg) {
+                message = msg;
+                phase = "working";
+                step = 0;
+                steps = 0;
+                detail = "";
+                visible = true;
+            }
+
+            // "章节 12/288: 爱因斯坦赤道" -> 12, 288, the title.
+            function applyProgress(text) {
+                message = text;
+                var m = /(\d+)\s*\/\s*(\d+)/.exec(text);
+                if (m) {
+                    step = parseInt(m[1]);
+                    steps = parseInt(m[2]);
+                    var colon = text.indexOf(":");
+                    detail = colon >= 0 ? text.substring(colon + 1).trim() : "";
+                } else {
+                    detail = "";
+                }
+            }
 
             Rectangle {
                 anchors.fill: parent
-                anchors.topMargin: 3
-                anchors.bottomMargin: -3
-                radius: weReadStyle.radius - 4
+                anchors.topMargin: 4
+                anchors.bottomMargin: -4
+                radius: weReadStyle.radius
                 color: weReadStyle.rim
             }
 
             Rectangle {
                 anchors.fill: parent
-                radius: weReadStyle.radius - 6
+                radius: weReadStyle.radius
                 color: weReadStyle.surface
                 border.color: weReadStyle.edge
                 border.width: 1
+                clip: true
 
-                Text {
-                    id: weReadStatusText
-                    anchors.centerIn: parent
-                    width: parent.width - 48
-                    wrapMode: Text.Wrap
-                    horizontalAlignment: Text.AlignHCenter
-                    font.family: weReadFont.name
-                    font.pixelSize: 23
-                    lineHeight: 1.25
-                    color: weReadStyle.inkSoft
-                    text: weReadStatus.message
+                Column {
+                    id: weReadStatusBody
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.leftMargin: weReadStyle.pad
+                    anchors.rightMargin: weReadStyle.pad
+                    spacing: 14
+
+                    Text {
+                        width: parent.width
+                        wrapMode: Text.Wrap
+                        horizontalAlignment: Text.AlignHCenter
+                        font.family: weReadFont.name
+                        font.pixelSize: 24
+                        lineHeight: 1.25
+                        color: weReadStyle.ink
+                        text: weReadStatus.phase === "working"
+                            ? (weReadStatus.steps > 0 ? "正在生成" : weReadStatus.message)
+                            : weReadStatus.message
+                    }
+
+                    // Chapter being decoded — secondary, and only while
+                    // there is one.
+                    Text {
+                        width: parent.width
+                        elide: Text.ElideRight
+                        horizontalAlignment: Text.AlignHCenter
+                        font.family: weReadFont.name
+                        font.pixelSize: 19
+                        color: weReadStyle.inkMuted
+                        visible: weReadStatus.phase === "working" && weReadStatus.steps > 0
+                        text: weReadStatus.detail
+                            ? (weReadStatus.step + " / " + weReadStatus.steps + " · " + weReadStatus.detail)
+                            : (weReadStatus.step + " / " + weReadStatus.steps)
+                    }
+
+                    // The bar. Track and fill only — no animation.
+                    Rectangle {
+                        width: parent.width
+                        height: 8
+                        radius: 4
+                        color: weReadStyle.fill
+                        border.color: weReadStyle.hairline
+                        border.width: 1
+                        visible: weReadStatus.phase === "working" && weReadStatus.steps > 0
+
+                        Rectangle {
+                            height: parent.height
+                            radius: parent.radius
+                            color: weReadStyle.ink
+                            width: Math.max(
+                                height,
+                                parent.width * Math.min(1, weReadStatus.step / Math.max(1, weReadStatus.steps)))
+                        }
+                    }
+
+                    // Refresh action. Only a brand-new document needs
+                    // it, and only the reader knows when it is a good
+                    // moment — xochitl restarting takes the screen away.
+                    Rectangle {
+                        id: weReadRefreshButton
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        width: weReadRefreshLabel.implicitWidth + 56
+                        height: weReadRefreshLabel.implicitHeight + 24
+                        radius: height / 2
+                        visible: weReadStatus.phase === "done_restart"
+                        color: refreshTap.pressed ? weReadStyle.ink : weReadStyle.surface
+                        border.color: weReadStyle.ink
+                        border.width: 2
+
+                        Text {
+                            id: weReadRefreshLabel
+                            anchors.centerIn: parent
+                            font.family: weReadFont.name
+                            font.pixelSize: 22
+                            color: refreshTap.pressed ? weReadStyle.surface : weReadStyle.ink
+                            text: "刷新书库"
+                        }
+
+                        MouseArea {
+                            id: refreshTap
+                            anchors.fill: parent
+                            onClicked: {
+                                weReadStatus.message = "正在刷新书库…";
+                                weReadStatus.phase = "working";
+                                weReadCmd.executeCommand("/bin/touch",
+                                    ["/home/root/xovi/exthome/weread/restart"]);
+                            }
+                        }
+                    }
+
+                    Text {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        font.family: weReadFont.name
+                        font.pixelSize: 17
+                        color: weReadStyle.inkMuted
+                        visible: weReadStatus.phase === "done_restart"
+                        text: "新书需要重启阅读器才会出现"
+                    }
                 }
             }
 
+            // Tapping the card dismisses it, except on the button.
             MouseArea {
                 anchors.fill: parent
+                z: -1
                 onClicked: { weReadStatus.visible = false; weReadGenPoller.stop(); }
-            }
-        }
-
-        Timer {
-            id: weReadGenPoller
-            interval: 500
-            repeat: true
-            property int elapsedMs: 0
-            onTriggered: {
-                elapsedMs += interval;
-                var raw = weReadIpc.readFile("gen.txt");
-                var lines = raw.split("\n");
-                var seq = parseInt(lines[0]);
-                if (!isNaN(seq) && seq > weReadStatus.lastSeq) {
-                    weReadStatus.lastSeq = seq;
-                    var status = lines.length > 1 ? lines[1] : "";
-                    weReadStatus.message = lines.length > 2 ? lines.slice(2).join(" ") : "";
-                    if (status === "working") { elapsedMs = 0; return; }
-                    // A fresh generation may have rewritten the layout
-                    // for the document that's open; drop the cache so
-                    // the next tap re-reads it.
-                    weReadIpc.layoutDocId = "";
-                    weReadIpc.layoutData = null;
-                    elapsedMs = 0;
-                    stop();
-                    weReadStatusHide.restart();
-                    return;
-                }
-                // A whole book takes a while; only give up after 30 min.
-                if (elapsedMs > 1800000) {
-                    weReadStatus.message = "(超时，看看 daemon 日志)";
-                    elapsedMs = 0;
-                    stop();
-                }
             }
         }
 
@@ -986,8 +1113,8 @@ IMPORT net.asivery.CommandExecutor 1.0
                                         wrapMode: Text.Wrap
                                         textFormat: Text.PlainText
                                         font.family: weReadFont.name
-                                        font.pixelSize: 25
-                                        lineHeight: 1.35
+                                        font.pixelSize: 26
+                                        lineHeight: 1.4
                                         color: weReadStyle.inkSoft
                                         text: modelData.content
                                     }

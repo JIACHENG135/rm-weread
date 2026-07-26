@@ -324,17 +324,16 @@ fn generate_book_id(
     // — the directory's inode is not among the watched ones) and exposes
     // no D-Bus call to rescan; the only sync interface on the bus drives
     // *cloud* sync, and a forged batchFinished signal provokes no reload.
-    // So a brand-new document genuinely cannot appear without a restart.
-    // Do it here rather than leaving it as a manual step: generation is
-    // something the reader asked for and waited minutes on, and it is
-    // only new documents that need it — an in-place refresh is already
-    // in the library.
+    // So a brand-new document cannot appear without restarting xochitl.
+    //
+    // The restart is offered as a button rather than performed here: a
+    // book takes minutes, the reader may well have moved on to another
+    // one, and yanking xochitl out from under them is not something to
+    // do unannounced. `done_restart` is what tells the popup to show it.
     if matches!(generated.delivery, Delivery::Created { .. }) {
-        gen_status("working", &format!("{message}，正在刷新书库…"));
-        match std::process::Command::new("systemctl").arg("restart").arg("xochitl").status() {
-            Ok(st) if st.success() => {}
-            other => eprintln!("weread: could not restart xochitl to show the new book: {other:?}"),
-        }
+        gen_status("done_restart", &message);
+    } else {
+        gen_status("done", &message);
     }
     Ok(message)
 }
@@ -377,7 +376,7 @@ fn answer_ask(
 fn main() {
     let paths = Paths::device();
     fs::create_dir_all(&paths.exthome).expect("failed to create weread exthome dir");
-    for stale in ["generate", "shelf", "open", "next", "prev", "close"] {
+    for stale in ["generate", "shelf", "restart", "open", "next", "prev", "close"] {
         let _ = fs::remove_file(exthome().join(stale));
     }
     let _ = take_asks();
@@ -414,6 +413,11 @@ fn main() {
 
     println!("weread_daemon: watching {} for triggers...", paths.exthome.display());
     loop {
+        if take_trigger("restart") {
+            println!("weread: restarting xochitl so a new document appears");
+            let _ = std::process::Command::new("systemctl").arg("restart").arg("xochitl").status();
+        }
+
         if take_trigger("shelf") {
             shelf_status("working", "正在读取书架…");
             match with_retry("shelf", || publish_shelf(&agent, &sess, &paths)) {
@@ -434,8 +438,9 @@ fn main() {
         for book_id in wanted {
             gen_status("working", "正在生成…");
             match with_retry("generate", || generate_book_id(&agent, &mut sess, &paths, &book_id)) {
-                Ok(message) => {
-                    gen_status("done", &message);
+                Ok(_) => {
+                    // generate_book_id already published the final
+                    // status, including whether a restart is needed.
                     review_cache.clear(); // ranges may have changed
                     let _ = session::save(Path::new(SESSION_PATH), &sess);
                     // The browser shows a "已生成" badge; keep it honest.
