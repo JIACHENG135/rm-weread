@@ -35,6 +35,10 @@ pub const REGISTRY_PATH: &str = "/home/root/.local/share/rm-weread/docs.json";
 /// scatter through the user's own documents.
 pub const FOLDER_NAME: &str = "微信读书";
 
+/// The card that opens the shelf browser. Named so it sorts and reads
+/// like an action, not like a book.
+pub const SHELF_CARD_NAME: &str = "＋ 书架";
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Registry {
     /// book_id → delivered document.
@@ -43,6 +47,9 @@ pub struct Registry {
     /// moving the folder on-device doesn't make us create a second one.
     #[serde(default)]
     pub folder_uuid: Option<String>,
+    /// uuid of the one-page "书架" card that opens the shelf browser.
+    #[serde(default)]
+    pub shelf_doc_uuid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +175,37 @@ fn find_collection(xochitl_dir: &Path, name: &str) -> Option<String> {
     // same name, so we don't ping-pong between them run to run.
     found.sort();
     found.into_iter().next()
+}
+
+/// Delivers the one-page "书架" card into the folder and returns its
+/// uuid, creating it only once.
+///
+/// It is left alone on later runs: it is a fixed page the reader may
+/// have scribbled on, and rewriting it would buy nothing.
+pub fn deliver_shelf_card(
+    xochitl_dir: &Path,
+    registry_path: &Path,
+    pdf: &[u8],
+) -> Result<String, Box<dyn std::error::Error>> {
+    fs::create_dir_all(xochitl_dir)?;
+    let mut reg = load_registry(registry_path);
+    let folder = ensure_folder(xochitl_dir, &mut reg)?;
+
+    if let Some(uuid) = &reg.shelf_doc_uuid
+        && xochitl_dir.join(format!("{uuid}.pdf")).exists()
+    {
+        let uuid = uuid.clone();
+        save_registry(registry_path, &reg)?;
+        return Ok(uuid);
+    }
+
+    let uuid = new_uuid();
+    write_pdf(xochitl_dir, &uuid, pdf)?;
+    write_content_file(xochitl_dir, &uuid, 1)?;
+    write_metadata(xochitl_dir, &uuid, SHELF_CARD_NAME, &folder)?;
+    reg.shelf_doc_uuid = Some(uuid.clone());
+    save_registry(registry_path, &reg)?;
+    Ok(uuid)
 }
 
 /// Documents delivered before the folder existed carry a "— 微信读书"
@@ -479,6 +517,28 @@ mod tests {
         assert_eq!(after["lastOpenedPage"], 42);
         assert_eq!(after["pinned"], true);
         assert_eq!(after["createdTime"], created);
+    }
+
+    #[test]
+    fn the_shelf_card_lands_in_the_folder_and_is_created_once() {
+        let (x, r) = temp_dirs("shelf-card");
+        let uuid = deliver_shelf_card(&x, &r, b"%PDF-card").unwrap();
+        let folder = load_registry(&r).folder_uuid.unwrap();
+        assert_eq!(meta(&x, &uuid)["parent"], folder);
+        assert_eq!(meta(&x, &uuid)["visibleName"], SHELF_CARD_NAME);
+        assert!(x.join(format!("{uuid}.content")).exists());
+
+        // Stable across runs: the reader may have written on it, and a
+        // changing uuid would break the QML trigger.
+        let again = deliver_shelf_card(&x, &r, b"%PDF-different").unwrap();
+        assert_eq!(again, uuid);
+        assert_eq!(fs::read(x.join(format!("{uuid}.pdf"))).unwrap(), b"%PDF-card");
+
+        // And it shares the folder with generated books.
+        let l = layout_for("正文一");
+        let Delivery::Created { uuid: book } = deliver(&x, &r, &l, b"v1").unwrap() else { panic!() };
+        assert_eq!(meta(&x, &book)["parent"], folder);
+        assert_eq!(collections(&x).len(), 1);
     }
 
     #[test]

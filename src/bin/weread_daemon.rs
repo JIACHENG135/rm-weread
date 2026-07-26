@@ -25,7 +25,7 @@
 use rm_weread::pipeline::{self, Paths};
 use rm_weread::underlines;
 use rm_weread::xochitl_doc::{self, Delivery};
-use rm_weread::{login, session, shelf};
+use rm_weread::{login, pdfgen, session, shelf};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -153,6 +153,27 @@ fn with_retry<T>(
         }
     }
     Err(last.unwrap_or_else(|| "unknown error".into()))
+}
+
+/// Makes sure the "＋ 书架" card exists in the folder and tells QML its
+/// uuid, so opening that document pops the shelf browser.
+fn ensure_shelf_card(paths: &Paths) {
+    let pdf = match pdfgen::shelf_card() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("weread: could not build the shelf card: {e}");
+            return;
+        }
+    };
+    match xochitl_doc::deliver_shelf_card(&paths.xochitl_dir, &paths.registry(), &pdf) {
+        Ok(uuid) => {
+            let path = paths.exthome.join("shelf_doc.txt");
+            if fs::read_to_string(&path).map(|s| s.trim() != uuid).unwrap_or(true) {
+                let _ = fs::write(&path, &uuid);
+            }
+        }
+        Err(e) => eprintln!("weread: could not deliver the shelf card: {e}"),
+    }
 }
 
 /// Publishes the shelf for the QML browser: `shelf.json` plus a cached
@@ -323,6 +344,7 @@ fn main() {
     }
     let _ = take_asks();
     let _ = take_gen_requests();
+    ensure_shelf_card(&paths);
     if !exthome().join("gen.txt").exists() {
         gen_status("done", "(空闲)");
     }

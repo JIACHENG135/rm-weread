@@ -112,6 +112,28 @@ IMPORT net.asivery.CommandExecutor 1.0
                 return layoutData;
             }
 
+            // Opening the "＋ 书架" card is the library-side entry
+            // point: the shelf browser lives in this patch, and this
+            // documentview file is the only injection point whose root
+            // type (TouchArea) is known — the library's own QML files
+            // have custom root types that qmldiff's TRAVERSE cannot be
+            // aimed at, and xochitl's QML is compiled, so they cannot be
+            // read off the device. A document is the one thing that is
+            // both visible in the folder and able to reach this code.
+            property string docId: {
+                try {
+                    var d = touchArea.view.document;
+                    return d ? ("" + d.id) : "";
+                } catch (e) {
+                    return "";
+                }
+            }
+
+            onDocIdChanged: {
+                if (!docId) return;
+                if (docId === readFile("shelf_doc.txt").trim()) weReadShelf.open();
+            }
+
             // xochitl uuid of the document currently open, "" if none.
             function openDocId() {
                 try {

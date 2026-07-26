@@ -1,0 +1,16 @@
+[Unit]
+# Activates XOVI's LD_PRELOAD hook before xochitl starts, which is what
+# makes the QML patch load. Without this the device boots into plain
+# xochitl and the shelf browser / review popup simply aren't there.
+Description=Activate XOVI (LD_PRELOAD hook) before xochitl starts
+DefaultDependencies=no
+After=local-fs.target home.mount
+Requires=local-fs.target home.mount
+
+[Service]
+Type=oneshot
+ExecStart=/home/root/xovi/start
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

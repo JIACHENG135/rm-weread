@@ -32,13 +32,23 @@ pub fn call<T: DeserializeOwned>(
     body.insert("api_name".to_string(), Value::String(api_name.to_string()));
     body.insert("skill_version".to_string(), Value::String(SKILL_VERSION.to_string()));
 
+    // Read the body even on 4xx/5xx. ureq turns a bad status into an
+    // Err whose body is discarded, and WeRead puts the *reason* in that
+    // body — a bare "http status: 403" cost real debugging time once.
     let mut resp = agent
         .post(GATEWAY_URL)
+        .config()
+        .http_status_as_error(false)
+        .build()
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
         .send_json(Value::Object(body))?;
 
+    let status = resp.status();
     let text = resp.body_mut().read_to_string()?;
+    if !status.is_success() {
+        return Err(format!("{api_name} -> HTTP {status}: {}", text.trim()).into());
+    }
     // `upgrade_info` just means a newer Skill spec version exists — the
     // response body still carries this call's real, complete data (see
     // the real payload we hit during development: a full shelf response

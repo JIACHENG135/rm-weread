@@ -402,6 +402,160 @@ impl Pdf {
     }
 }
 
+/// Emits the Type0/CIDFontType2/descriptor/FontFile2 chain, plus the
+/// ToUnicode CMap when an id is given (so text extraction and native
+/// selection work). Shared by the book and the shelf card.
+#[allow(clippy::too_many_arguments)]
+fn write_font_objects(
+    pdf: &mut Pdf,
+    font: &FontInfo,
+    font_data: &[u8],
+    used: &mut BTreeMap<u16, char>,
+    type0_id: usize,
+    cidfont_id: usize,
+    descriptor_id: usize,
+    fontfile_id: usize,
+    tounicode_id: Option<usize>,
+) {
+    used.entry(0).or_insert('\u{0}'); // .notdef, so W always has an entry
+    let w_entries: Vec<String> = used.keys().map(|gid| format!("{gid} [{}]", font.advance(*gid))).collect();
+    let tounicode = match tounicode_id {
+        Some(id) => format!(" /ToUnicode {id} 0 R"),
+        None => String::new(),
+    };
+    pdf.set(
+        type0_id,
+        format!(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /NotoSansCJKsc /Encoding /Identity-H \
+             /DescendantFonts [{cidfont_id} 0 R]{tounicode} >>"
+        )
+        .into_bytes(),
+    );
+    pdf.set(
+        cidfont_id,
+        format!(
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /NotoSansCJKsc \
+             /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+             /FontDescriptor {descriptor_id} 0 R /DW 1000 /W [{}] /CIDToGIDMap /Identity >>",
+            w_entries.join(" ")
+        )
+        .into_bytes(),
+    );
+    let bbox = font.face.global_bounding_box();
+    let sc = font.scale;
+    pdf.set(
+        descriptor_id,
+        format!(
+            "<< /Type /FontDescriptor /FontName /NotoSansCJKsc /Flags 4 \
+             /FontBBox [{} {} {} {}] /ItalicAngle 0 /Ascent {} /Descent {} \
+             /CapHeight {} /StemV 80 /FontFile2 {fontfile_id} 0 R >>",
+            (bbox.x_min as f32 * sc) as i32,
+            (bbox.y_min as f32 * sc) as i32,
+            (bbox.x_max as f32 * sc) as i32,
+            (bbox.y_max as f32 * sc) as i32,
+            (font.face.ascender() as f32 * sc) as i32,
+            (font.face.descender() as f32 * sc) as i32,
+            (font.face.ascender() as f32 * sc * 0.7) as i32,
+        )
+        .into_bytes(),
+    );
+    pdf.set(
+        fontfile_id,
+        Pdf::stream(&format!(" /Length1 {}", font_data.len()), flate(font_data)),
+    );
+
+    let Some(tid) = tounicode_id else { return };
+    let mut cmap = String::from(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+         /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+         /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+         1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
+    );
+    let entries: Vec<(u16, char)> = used.iter().filter(|(_, c)| **c != '\u{0}').map(|(g, c)| (*g, *c)).collect();
+    for chunk in entries.chunks(100) {
+        let _ = writeln!(cmap, "{} beginbfchar", chunk.len());
+        for (gid, c) in chunk {
+            let mut u = String::new();
+            for cu in c.encode_utf16([0u16; 2].as_mut()) {
+                let _ = write!(u, "{cu:04X}");
+            }
+            let _ = writeln!(cmap, "<{gid:04X}> <{u}>");
+        }
+        cmap.push_str("endbfchar\n");
+    }
+    cmap.push_str("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+    pdf.set(tid, Pdf::stream("", flate(cmap.as_bytes())));
+}
+
+/// A one-page "书架" card, delivered into the 微信读书 folder as its own
+/// document.
+///
+/// This exists because the shelf browser lives in a QML patch on
+/// `SceneViewGestures.qml` — the document view — and that is the only
+/// injection point whose root type is known (`TouchArea`). The library
+/// view's QML files have custom root types that qmldiff's TRAVERSE
+/// cannot be pointed at without knowing them, and xochitl's own QML is
+/// compiled, so they can't be read off the device. A document is
+/// therefore the one thing that is both visible in the folder and able
+/// to trigger our patch: opening it opens the browser.
+pub fn shelf_card() -> Result<Vec<u8>, String> {
+    let font = FontInfo::parse(FONT)?;
+    let mut used: BTreeMap<u16, char> = BTreeMap::new();
+    let mut pdf = Pdf::new();
+    let catalog_id = pdf.alloc();
+    let pages_id = pdf.alloc();
+    let info_id = pdf.alloc();
+    let type0_id = pdf.alloc();
+    let cidfont_id = pdf.alloc();
+    let descriptor_id = pdf.alloc();
+    let fontfile_id = pdf.alloc();
+    let page_id = pdf.alloc();
+    let content_id = pdf.alloc();
+
+    let mut s = String::new();
+    let centre = |font: &FontInfo, used: &mut BTreeMap<u16, char>, size: f32, y: f32, gray: f32, t: &str| {
+        let w = text_width(font, size, t);
+        show_text_at(font, used, size, (layout::PAGE_W_PT - w) / 2.0, y, gray, t)
+    };
+    s.push_str(&centre(&font, &mut used, 44.0, layout::PAGE_H_PT * 0.60, 0.1, "微信读书"));
+    s.push_str(&centre(&font, &mut used, 26.0, layout::PAGE_H_PT * 0.60 - 60.0, 0.45, "书架"));
+    let rule_w = 180.0;
+    let _ = writeln!(
+        s,
+        "q 0.75 G 1 w {:.2} {:.2} m {:.2} {:.2} l S Q",
+        (layout::PAGE_W_PT - rule_w) / 2.0,
+        layout::PAGE_H_PT * 0.60 - 110.0,
+        (layout::PAGE_W_PT + rule_w) / 2.0,
+        layout::PAGE_H_PT * 0.60 - 110.0
+    );
+    s.push_str(&centre(&font, &mut used, 22.0, layout::PAGE_H_PT * 0.60 - 160.0, 0.35, "打开这一页即可浏览书架"));
+    s.push_str(&centre(&font, &mut used, 18.0, layout::PAGE_H_PT * 0.60 - 200.0, 0.55, "选一本书，生成到设备上"));
+    s.push_str(&centre(&font, &mut used, 14.0, 70.0, 0.6, "在书页上四指点击也可以打开"));
+
+    pdf.set(content_id, Pdf::stream("", flate(s.as_bytes())));
+    pdf.set(
+        page_id,
+        format!(
+            "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {} {}] \
+             /Resources << /Font << /F1 {type0_id} 0 R >> >> /Contents {content_id} 0 R >>",
+            layout::PAGE_W_PT,
+            layout::PAGE_H_PT
+        )
+        .into_bytes(),
+    );
+    pdf.set(
+        pages_id,
+        format!("<< /Type /Pages /Kids [{page_id} 0 R] /Count 1 >>").into_bytes(),
+    );
+    write_font_objects(&mut pdf, &font, FONT, &mut used, type0_id, cidfont_id, descriptor_id, fontfile_id, None);
+    pdf.set(catalog_id, format!("<< /Type /Catalog /Pages {pages_id} 0 R >>").into_bytes());
+    pdf.set(
+        info_id,
+        format!("<< /Title {} /Producer (rm-weread) >>", utf16_hex("书架")).into_bytes(),
+    );
+    Ok(pdf.finish(catalog_id, info_id))
+}
+
 /// Generates the whole-book PDF matching `layout` (which must have been
 /// built from these same `chapters` — same order, same pages).
 pub fn generate(book: &BookLayout, chapters: &[ChapterInput], cover_jpeg: Option<&[u8]>) -> Result<Vec<u8>, String> {
@@ -548,70 +702,17 @@ pub fn generate_with_font(
     );
 
     // ---- Font ----
-    used.entry(0).or_insert('\u{0}'); // .notdef, so W always has an entry
-    let w_entries: Vec<String> = used.keys().map(|gid| format!("{gid} [{}]", font.advance(*gid))).collect();
-    pdf.set(
+    write_font_objects(
+        &mut pdf,
+        &font,
+        font_data,
+        &mut used,
         type0_id,
-        format!(
-            "<< /Type /Font /Subtype /Type0 /BaseFont /NotoSansCJKsc /Encoding /Identity-H \
-             /DescendantFonts [{cidfont_id} 0 R] /ToUnicode {tounicode_id} 0 R >>"
-        )
-        .into_bytes(),
-    );
-    pdf.set(
         cidfont_id,
-        format!(
-            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /NotoSansCJKsc \
-             /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
-             /FontDescriptor {descriptor_id} 0 R /DW 1000 /W [{}] /CIDToGIDMap /Identity >>",
-            w_entries.join(" ")
-        )
-        .into_bytes(),
-    );
-    let bbox = font.face.global_bounding_box();
-    let sc = font.scale;
-    pdf.set(
         descriptor_id,
-        format!(
-            "<< /Type /FontDescriptor /FontName /NotoSansCJKsc /Flags 4 \
-             /FontBBox [{} {} {} {}] /ItalicAngle 0 /Ascent {} /Descent {} \
-             /CapHeight {} /StemV 80 /FontFile2 {fontfile_id} 0 R >>",
-            (bbox.x_min as f32 * sc) as i32,
-            (bbox.y_min as f32 * sc) as i32,
-            (bbox.x_max as f32 * sc) as i32,
-            (bbox.y_max as f32 * sc) as i32,
-            (font.face.ascender() as f32 * sc) as i32,
-            (font.face.descender() as f32 * sc) as i32,
-            (font.face.ascender() as f32 * sc * 0.7) as i32,
-        )
-        .into_bytes(),
-    );
-    pdf.set(
         fontfile_id,
-        Pdf::stream(&format!(" /Length1 {}", font_data.len()), flate(font_data)),
+        Some(tounicode_id),
     );
-
-    // ToUnicode CMap so text extraction / native selection works.
-    let mut cmap = String::from(
-        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
-         /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
-         /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
-         1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
-    );
-    let entries: Vec<(u16, char)> = used.iter().filter(|(_, c)| **c != '\u{0}').map(|(g, c)| (*g, *c)).collect();
-    for chunk in entries.chunks(100) {
-        let _ = writeln!(cmap, "{} beginbfchar", chunk.len());
-        for (gid, c) in chunk {
-            let mut u = String::new();
-            for cu in c.encode_utf16([0u16; 2].as_mut()) {
-                let _ = write!(u, "{cu:04X}");
-            }
-            let _ = writeln!(cmap, "<{gid:04X}> <{u}>");
-        }
-        cmap.push_str("endbfchar\n");
-    }
-    cmap.push_str("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
-    pdf.set(tounicode_id, Pdf::stream("", flate(cmap.as_bytes())));
 
     // ---- Outlines: one entry per chapter ----
     for (ci, oid) in outline_ids.iter().enumerate() {
@@ -805,6 +906,18 @@ mod tests {
         let s = String::from_utf8_lossy(&pdf);
         assert!(!s.contains("/DCTDecode"));
         assert!(s.contains(&format!("/Count {}", l.page_count)));
+    }
+
+    #[test]
+    fn the_shelf_card_is_one_valid_page() {
+        let pdf = shelf_card().unwrap();
+        let s = String::from_utf8_lossy(&pdf);
+        assert!(s.starts_with("%PDF-1.6"));
+        assert!(s.contains("/Count 1"));
+        assert!(s.contains("/Type /Font"));
+        assert!(s.trim_end().ends_with("%%EOF"));
+        // Deterministic, like every other artifact here.
+        assert_eq!(shelf_card().unwrap(), pdf);
     }
 
     #[test]
