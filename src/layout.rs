@@ -24,7 +24,7 @@
 //! this hash is unchanged (decoration-only refresh); a changed hash
 //! must produce a *new* document (xochitl_doc.rs enforces this).
 
-use crate::paginate::{self, Page};
+use crate::paginate::Page;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
