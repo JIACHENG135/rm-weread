@@ -105,6 +105,24 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
+/// True when a delivered document is still in the library.
+///
+/// Deleting on this firmware means `parent: "trash"` — the metadata
+/// file stays put and `deleted` stays false, so presence on disk proves
+/// nothing. Without this check the shelf browser kept showing a book as
+/// "on the device" after the reader had thrown it away, and a rebuild
+/// would have tried to refresh a document sitting in the trash.
+pub fn document_is_live(xochitl_dir: &Path, uuid: &str) -> bool {
+    let Ok(raw) = fs::read_to_string(xochitl_dir.join(format!("{uuid}.metadata"))) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    v.get("deleted").and_then(|d| d.as_bool()) != Some(true)
+        && v.get("parent").and_then(|p| p.as_str()) != Some("trash")
+}
+
 /// True when the document's directory contains any pen strokes.
 fn has_ink(xochitl_dir: &Path, uuid: &str) -> bool {
     let dir = xochitl_dir.join(uuid);
@@ -296,6 +314,15 @@ pub fn deliver(
     // old "— 微信读书" suffix would just repeat it in every row.
     let visible_name = layout.title.clone();
 
+    // A book whose document the reader deleted starts over: refreshing
+    // or "replacing" something in the trash would resurrect it in place
+    // and leave them with a document they threw away.
+    if let Some(doc) = reg.books.get(&layout.book_id)
+        && !document_is_live(xochitl_dir, &doc.uuid)
+    {
+        reg.books.remove(&layout.book_id);
+    }
+
     let delivery = match reg.books.get(&layout.book_id) {
         Some(doc) if doc.content_sha256 == layout.content_sha256 => {
             // Geometry unchanged: decoration-only refresh, ink is safe.
@@ -365,12 +392,12 @@ mod tests {
     }
 
     fn layout_for(text: &str) -> BookLayout {
-        let grid = Grid { cols: 10, lines_per_page: 4, ..Grid::default() };
+        let grid = Grid { text_em: 5000, lines_per_page: 4, ..Grid::default() };
         let chapters = vec![crate::layout::ChapterInput {
             chapter_uid: 1,
             title: "一".into(),
             text: text.into(),
-            pages: paginate(text, grid.cols, grid.lines_per_page),
+            pages: paginate(text, grid.text_em, grid.lines_per_page),
             hot: vec![],
         }];
         build("book9", "书名", "作者", &chapters, grid, false)
@@ -535,6 +562,34 @@ mod tests {
         let Delivery::Created { uuid: book } = deliver(&x, &r, &l, b"v1").unwrap() else { panic!() };
         assert_eq!(meta(&x, &book)["parent"], folder);
         assert_eq!(collections(&x).len(), 1);
+    }
+
+    #[test]
+    fn a_trashed_document_stops_counting_as_delivered() {
+        let (x, r) = temp_dirs("trashed");
+        let l = layout_for("正文一");
+        let Delivery::Created { uuid: first } = deliver(&x, &r, &l, b"v1").unwrap() else { panic!() };
+        assert!(document_is_live(&x, &first));
+
+        // Deleting on device means parent: "trash"; the metadata file
+        // stays and `deleted` stays false.
+        let mut m = meta(&x, &first);
+        m["parent"] = "trash".into();
+        fs::write(
+            x.join(format!("{first}.metadata")),
+            serde_json::to_string_pretty(&m).unwrap(),
+        )
+        .unwrap();
+        assert!(!document_is_live(&x, &first));
+
+        // Same content, but it must not refresh the trashed document —
+        // that would resurrect something the reader threw away.
+        let d = deliver(&x, &r, &l, b"v2").unwrap();
+        let Delivery::Created { uuid: second } = d else { panic!("expected Created, got {d:?}") };
+        assert_ne!(second, first);
+        assert_eq!(load_registry(&r).books["book9"].uuid, second);
+        // And the name is clean: this is a first delivery, not "(更新版)".
+        assert_eq!(meta(&x, &second)["visibleName"], "书名");
     }
 
     #[test]

@@ -8,7 +8,7 @@ use rm_weread::{login, paginate, reader, session, shelf, xhtml};
 use std::path::PathBuf;
 
 // A rough rM2/Paper Pro portrait text area: ~32 CJK glyphs wide, 26 lines.
-const WIDTH_COLUMNS: usize = 64;
+const WIDTH_EM: u32 = 32000;
 const LINES_PER_PAGE: usize = 26;
 
 fn arg(name: &str) -> Option<String> {
@@ -53,8 +53,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         text.char_len()
     );
 
-    let pages = paginate::paginate(&text.text, WIDTH_COLUMNS, LINES_PER_PAGE);
-    println!("{} page(s) at {WIDTH_COLUMNS} columns x {LINES_PER_PAGE} lines\n", pages.len());
+    let pages = paginate::paginate(&text.text, WIDTH_EM, LINES_PER_PAGE);
+    println!("{} page(s) at {WIDTH_EM} columns x {LINES_PER_PAGE} lines\n", pages.len());
 
     let page_no: usize = arg("--page").and_then(|s| s.parse().ok()).unwrap_or(0);
     let page = pages.get(page_no).ok_or("page index out of range")?;

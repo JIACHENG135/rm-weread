@@ -264,7 +264,10 @@ fn publish_shelf(
             "author": b.author,
             "cover": cover_rel.unwrap_or_default(),
             "finished": b.finish_reading != 0,
-            "generated": reg.books.contains_key(&b.book_id),
+            "generated": reg
+                .books
+                .get(&b.book_id)
+                .is_some_and(|d| xochitl_doc::document_is_live(&paths.xochitl_dir, &d.uuid)),
         }));
     }
 

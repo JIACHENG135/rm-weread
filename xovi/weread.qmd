@@ -499,11 +499,80 @@ IMPORT net.asivery.CommandExecutor 1.0
                                     }
                                 }
 
+                                // Status accessory, drawn rather than
+                                // typed: ✓ and ＋ are not guaranteed to
+                                // be in the subset font, and a missing
+                                // glyph here would read as a tofu box
+                                // against an otherwise clean row.
+                                // Outline + plus = available to
+                                // generate; filled + check = already on
+                                // the device, the same "action vs
+                                // completed" distinction SF Symbols
+                                // draws with plus.circle and
+                                // checkmark.circle.fill.
+                                Item {
+                                    id: weReadShelfMark
+                                    width: 44
+                                    height: 44
+                                    anchors.right: parent.right
+                                    anchors.rightMargin: weReadStyle.pad
+                                    anchors.verticalCenter: parent.verticalCenter
+
+                                    Rectangle {
+                                        anchors.fill: parent
+                                        radius: width / 2
+                                        color: modelData.generated ? weReadStyle.ink : "transparent"
+                                        border.color: weReadStyle.ink
+                                        border.width: 2
+                                    }
+
+                                    // Plus: two bars.
+                                    Rectangle {
+                                        anchors.centerIn: parent
+                                        width: 20
+                                        height: 3
+                                        color: weReadStyle.ink
+                                        visible: !modelData.generated
+                                    }
+                                    Rectangle {
+                                        anchors.centerIn: parent
+                                        width: 3
+                                        height: 20
+                                        color: weReadStyle.ink
+                                        visible: !modelData.generated
+                                    }
+
+                                    // Check: a short stroke and a long
+                                    // one, meeting at the low corner.
+                                    Rectangle {
+                                        x: 11
+                                        y: 22
+                                        width: 11
+                                        height: 3
+                                        radius: 1.5
+                                        color: weReadStyle.surface
+                                        rotation: 45
+                                        transformOrigin: Item.Left
+                                        visible: modelData.generated
+                                    }
+                                    Rectangle {
+                                        x: 18
+                                        y: 27
+                                        width: 19
+                                        height: 3
+                                        radius: 1.5
+                                        color: weReadStyle.surface
+                                        rotation: -50
+                                        transformOrigin: Item.Left
+                                        visible: modelData.generated
+                                    }
+                                }
+
                                 Column {
                                     anchors.left: weReadShelfCover.right
                                     anchors.leftMargin: 22
-                                    anchors.right: parent.right
-                                    anchors.rightMargin: weReadStyle.pad
+                                    anchors.right: weReadShelfMark.left
+                                    anchors.rightMargin: 20
                                     anchors.verticalCenter: parent.verticalCenter
                                     spacing: 10
 
@@ -525,23 +594,11 @@ IMPORT net.asivery.CommandExecutor 1.0
                                         color: weReadStyle.inkMuted
                                         text: modelData.author
                                     }
-                                    Rectangle {
-                                        width: weReadShelfBadge.implicitWidth + 22
-                                        height: weReadShelfBadge.implicitHeight + 12
-                                        radius: height / 2
-                                        color: weReadStyle.fill
-                                        border.color: weReadStyle.hairline
-                                        border.width: 1
-                                        visible: modelData.generated
-
-                                        Text {
-                                            id: weReadShelfBadge
-                                            anchors.centerIn: parent
-                                            font.family: weReadFont.name
-                                            font.pixelSize: 18
-                                            color: weReadStyle.inkMuted
-                                            text: "已在设备上 · 点按刷新"
-                                        }
+                                    Text {
+                                        font.family: weReadFont.name
+                                        font.pixelSize: 18
+                                        color: weReadStyle.inkMuted
+                                        text: modelData.generated ? "已在设备上 · 点按可重新生成" : "点按生成到设备"
                                     }
                                 }
 
@@ -770,7 +827,13 @@ IMPORT net.asivery.CommandExecutor 1.0
             width: Math.min(parent.width * 0.78, 720)
             height: weReadStatusBody.implicitHeight + 2 * weReadStyle.pad
             anchors.horizontalCenter: parent.horizontalCenter
-            y: 40
+            // Bottom, not top. Two reasons: the generated pages carry a
+            // running chapter title in the top margin and the card was
+            // sitting on it, and the card grows a button — which wants
+            // to be where a thumb already is, not at the far edge of a
+            // 2160px-tall screen.
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: 48
 
             property int lastSeq: 0
             property string message: ""
@@ -779,6 +842,34 @@ IMPORT net.asivery.CommandExecutor 1.0
             property int step: 0
             property int steps: 0
             property string detail: ""
+
+            // The whole patch lives inside the document view, so it is
+            // destroyed the moment you go back to the library and built
+            // fresh when you open something else. A card driven only by
+            // reset() therefore vanishes if you navigate away mid-run —
+            // which is exactly what happened the first time a real
+            // 227-chapter book was generated. Recover the state from
+            // gen.txt instead, so progress follows you between
+            // documents and across an xochitl restart.
+            Component.onCompleted: restore()
+
+            function restore() {
+                var lines = weReadIpc.readFile("gen.txt").split("\n");
+                var seq = parseInt(lines[0]);
+                lastSeq = isNaN(seq) ? 0 : seq;
+                var status = lines.length > 1 ? lines[1] : "";
+                var body = lines.length > 2 ? lines.slice(2).join(" ") : "";
+                if (status === "working") {
+                    phase = "working";
+                    applyProgress(body);
+                    visible = true;
+                    weReadGenPoller.start();
+                } else if (status === "done_restart") {
+                    phase = status;
+                    message = body;
+                    visible = true;
+                }
+            }
 
             function reset(msg) {
                 message = msg;
@@ -792,10 +883,16 @@ IMPORT net.asivery.CommandExecutor 1.0
             // "章节 12/288: 爱因斯坦赤道" -> 12, 288, the title.
             function applyProgress(text) {
                 message = text;
-                var m = /(\d+)\s*\/\s*(\d+)/.exec(text);
+                var m = /章节\s*(\d+)\s*\/\s*(\d+)/.exec(text);
                 if (m) {
+                    var prev = step;
                     step = parseInt(m[1]);
                     steps = parseInt(m[2]);
+                    // Sparse proof that the bar is actually being fed,
+                    // rather than sitting at whatever it restored to.
+                    if (Math.floor(step / 10) !== Math.floor(prev / 10)) {
+                        weReadIpc.beacon("progress_" + step + "_of_" + steps);
+                    }
                     var colon = text.indexOf(":");
                     detail = colon >= 0 ? text.substring(colon + 1).trim() : "";
                 } else {
@@ -927,6 +1024,52 @@ IMPORT net.asivery.CommandExecutor 1.0
                 anchors.fill: parent
                 z: -1
                 onClicked: { weReadStatus.visible = false; weReadGenPoller.stop(); }
+            }
+        }
+
+        // Drives the progress card from gen.txt. (This Timer was
+        // accidentally deleted when the card above was rewritten as one
+        // block, and nothing caught it: QML resolves ids at *call*
+        // time, so a missing one is a runtime ReferenceError on a line
+        // that only executes mid-generation — the bar simply froze at
+        // whatever it had restored to. The id audit that found it is
+        // worth keeping in mind for any future block surgery here.)
+        Timer {
+            id: weReadGenPoller
+            interval: 500
+            repeat: true
+            property int elapsedMs: 0
+            onTriggered: {
+                elapsedMs += interval;
+                var lines = weReadIpc.readFile("gen.txt").split("\n");
+                var seq = parseInt(lines[0]);
+                if (!isNaN(seq) && seq > weReadStatus.lastSeq) {
+                    weReadStatus.lastSeq = seq;
+                    var status = lines.length > 1 ? lines[1] : "";
+                    var body = lines.length > 2 ? lines.slice(2).join(" ") : "";
+                    if (status === "working") {
+                        weReadStatus.applyProgress(body);
+                        elapsedMs = 0;
+                        return;
+                    }
+                    weReadStatus.message = body;
+                    weReadStatus.phase = status;
+                    weReadIpc.layoutDocId = "";
+                    weReadIpc.layoutData = null;
+                    elapsedMs = 0;
+                    stop();
+                    // A card offering an action must not time out from
+                    // under the finger reaching for it.
+                    if (status !== "done_restart") weReadStatusHide.restart();
+                    return;
+                }
+                // A whole book takes a while; only give up after 30 min.
+                if (elapsedMs > 1800000) {
+                    weReadStatus.phase = "error";
+                    weReadStatus.message = "生成超时，请查看 daemon 日志";
+                    elapsedMs = 0;
+                    stop();
+                }
             }
         }
 

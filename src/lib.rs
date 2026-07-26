@@ -5,6 +5,7 @@ pub mod content;
 pub mod cookie;
 pub mod layout;
 pub mod login;
+pub mod metrics;
 pub mod paginate;
 pub mod pdfgen;
 pub mod pipeline;

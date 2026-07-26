@@ -26,7 +26,7 @@ fn main() {
         rm_weread::layout::ChapterInput {
             chapter_uid: 1,
             title: "第一章 球状闪电".into(),
-            pages: paginate(&body1, grid.cols, grid.lines_per_page),
+            pages: paginate(&body1, grid.text_em, grid.lines_per_page),
             hot: vec![
                 HotInput { range: "100-140".into(), off: 10, len: 22, count: 2311 },
                 HotInput { range: "300-330".into(), off: 60, len: 18, count: 154 },
@@ -37,7 +37,7 @@ fn main() {
         rm_weread::layout::ChapterInput {
             chapter_uid: 2,
             title: "第二章".into(),
-            pages: paginate(&body2, grid.cols, grid.lines_per_page),
+            pages: paginate(&body2, grid.text_em, grid.lines_per_page),
             hot: vec![HotInput { range: "40-60".into(), off: 8, len: 10, count: 999 }],
             text: body2,
         },

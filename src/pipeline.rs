@@ -206,7 +206,7 @@ fn build_chapters(
             }
             HotPolicy::ReuseKnown => previous.unwrap_or_default().iter().map(clone_hot).collect(),
         };
-        let pages = paginate::paginate(&text.text, grid.cols, grid.lines_per_page);
+        let pages = paginate::paginate(&text.text, grid.text_em, grid.lines_per_page);
         inputs.push(ChapterInput {
             chapter_uid: ch.chapter_uid,
             title: ch.title.clone(),
@@ -331,7 +331,7 @@ pub fn hot_for_chapter(
     let raw = fs::read_to_string(&cache)
         .map_err(|e| format!("chapter cache missing for {chapter_uid}: {e}"))?;
     let text = xhtml::to_text(&raw);
-    let pages = paginate::paginate(&text.text, book.grid.cols, book.grid.lines_per_page);
+    let pages = paginate::paginate(&text.text, book.grid.text_em, book.grid.lines_per_page);
 
     let underlines = underlines::fetch_underlines(agent, api_key, book_id, chapter_uid)?;
     let mapped = underlines::map_to_text(&underlines, &text);

@@ -44,31 +44,28 @@ pub struct Grid {
     pub margin_x_pt: f32,
     pub margin_top_pt: f32,
     pub margin_bottom_pt: f32,
-    /// Text width in paginate.rs columns (a CJK glyph is 2 columns, one
-    /// column is half an em).
-    pub cols: usize,
+    /// Text width in 1/1000 em (see `metrics`). Was a count of
+    /// half-em "columns"; proportional Latin has no columns to count.
+    pub text_em: u32,
     pub lines_per_page: usize,
 }
 
 impl Default for Grid {
     fn default() -> Self {
-        // 58 cols × 10pt/col = 580pt of text; 27 lines × 30pt = 810pt.
-        // Both fit inside 702×936 with the margins below.
+        // 594pt of text at 20pt type is 29.7 em per line; 27 lines ×
+        // 30pt = 810pt. Both fit inside 702×936 with the margins below.
         Grid {
             font_pt: 20.0,
             margin_x_pt: 54.0,
             margin_top_pt: 72.0,
             margin_bottom_pt: 54.0,
-            cols: 58,
+            text_em: 29_700,
             lines_per_page: 27,
         }
     }
 }
 
 impl Grid {
-    pub fn col_pt(&self) -> f32 {
-        self.font_pt / 2.0
-    }
     pub fn line_pt(&self) -> f32 {
         self.font_pt * 1.5
     }
@@ -80,20 +77,15 @@ impl Grid {
     pub fn baseline_pt(&self, row: usize) -> f32 {
         self.line_top_pt(row) + BASELINE_FACTOR * self.line_pt()
     }
-    /// Left edge of column `col`, in points from the page left.
-    pub fn col_x_pt(&self, col: usize) -> f32 {
-        self.margin_x_pt + col as f32 * self.col_pt()
+    /// Distance from the page's left edge, in points, for a position
+    /// `em_units` (1/1000 em) into the text column.
+    pub fn x_pt(&self, em_units: u32) -> f32 {
+        self.margin_x_pt + em_units as f32 * self.font_pt / 1000.0
     }
-}
-
-/// Column index (relative to the line start) where the `char_idx`-th
-/// character of `line_text` begins.
-pub fn col_of_char(line_text: &str, char_idx: usize) -> usize {
-    line_text
-        .chars()
-        .take(char_idx)
-        .map(paginate::char_width)
-        .sum()
+    /// Width of the text column in points.
+    pub fn text_w_pt(&self) -> f32 {
+        self.text_em as f32 * self.font_pt / 1000.0
+    }
 }
 
 /// One laid-out body line. Geometry is derived (`Grid`), so only the
@@ -197,13 +189,14 @@ pub struct HotInput {
 pub struct UnderlineSeg {
     pub page: usize,
     pub row: usize,
-    pub col_start: usize,
+    /// Distance into the line, in 1/1000 em, where the run starts.
+    pub start_em: u32,
     /// Exclusive.
-    pub col_end: usize,
+    pub end_em: u32,
 }
 
 /// Computes where a hot range [off, off+len) lands on the laid-out
-/// pages, as per-line column segments.
+/// pages, as per-line runs measured in 1/1000 em from the line start.
 pub fn underline_segments(pages: &[Page], off: usize, len: usize) -> Vec<UnderlineSeg> {
     let end = off + len;
     let mut segs = Vec::new();
@@ -224,8 +217,8 @@ pub fn underline_segments(pages: &[Page], off: usize, len: usize) -> Vec<Underli
             segs.push(UnderlineSeg {
                 page: pi,
                 row,
-                col_start: col_of_char(line, s - line_start),
-                col_end: col_of_char(line, e - line_start),
+                start_em: crate::metrics::advance_before(line, s - line_start),
+                end_em: crate::metrics::advance_before(line, e - line_start),
             });
         }
     }
@@ -244,7 +237,9 @@ pub fn underline_segments(pages: &[Page], off: usize, len: usize) -> Vec<Underli
 /// hash, xochitl_doc would treat the rebuild as a decoration-only
 /// refresh, and it would swap re-flowed pages under ink anchored to the
 /// old ones. v2: curly quotes, ellipsis and dashes became full-width.
-pub const LAYOUT_ALGO_VERSION: u32 = 2;
+/// v3: characters are measured at their real font advances instead of
+/// snapped to a half-em grid, so every line in every book re-flows.
+pub const LAYOUT_ALGO_VERSION: u32 = 3;
 
 pub fn content_hash(chapters: &[ChapterInput], grid: &Grid, has_cover: bool) -> String {
     let mut h = Sha256::new();
@@ -261,7 +256,7 @@ pub fn content_hash(chapters: &[ChapterInput], grid: &Grid, has_cover: bool) -> 
         grid.margin_x_pt,
         grid.margin_top_pt,
         grid.margin_bottom_pt,
-        grid.cols,
+        grid.text_em,
         grid.lines_per_page,
         PAGE_W_PT,
         PAGE_H_PT,
@@ -310,8 +305,8 @@ pub fn chapter_taps(
                 grid,
                 page_start + seg.page,
                 seg.row,
-                seg.col_start,
-                seg.col_end,
+                seg.start_em,
+                seg.end_em,
                 chapter_uid,
                 &h.range,
                 h.count,
@@ -398,8 +393,8 @@ fn tap_box(
     grid: &Grid,
     page: usize,
     row: usize,
-    col_start: usize,
-    col_end: usize,
+    start_em: u32,
+    end_em: u32,
     chapter_uid: i64,
     range: &str,
     count: u32,
@@ -407,8 +402,8 @@ fn tap_box(
     let top = grid.line_top_pt(row);
     Tap {
         page,
-        x0: grid.col_x_pt(col_start) / PAGE_W_PT,
-        x1: grid.col_x_pt(col_end.min(grid.cols)) / PAGE_W_PT,
+        x0: grid.x_pt(start_em) / PAGE_W_PT,
+        x1: grid.x_pt(end_em.min(grid.text_em)) / PAGE_W_PT,
         y0: top / PAGE_H_PT,
         y1: (top + grid.line_pt() * (1.0 + TAP_SLOP_BELOW)) / PAGE_H_PT,
         chapter_uid,
@@ -448,12 +443,12 @@ mod tests {
     use crate::paginate::paginate;
 
     fn chapter(uid: i64, text: &str, hot: Vec<HotInput>) -> ChapterInput {
-        let grid = Grid { cols: 6, lines_per_page: 2, ..Grid::default() };
+        let grid = Grid { text_em: 3000, lines_per_page: 2, ..Grid::default() };
         ChapterInput {
             chapter_uid: uid,
             title: format!("第{uid}章"),
             text: text.to_string(),
-            pages: paginate(text, grid.cols, grid.lines_per_page),
+            pages: paginate(text, grid.text_em, grid.lines_per_page),
             hot,
         }
     }
@@ -464,33 +459,36 @@ mod tests {
 
     #[test]
     fn underline_segments_split_across_lines_and_pages() {
-        // 3 CJK chars per line, 2 lines per page.
-        let pages = paginate("一二三四五六七八九十", 6, 2);
+        // 3 CJK chars (1 em each) per line, 2 lines per page.
+        let pages = paginate("一二三四五六七八九十", 3000, 2);
         // chars 2..8 span line 2 of page 0 through line 1 of page 1.
         let segs = underline_segments(&pages, 2, 6);
         assert_eq!(
             segs,
             vec![
-                UnderlineSeg { page: 0, row: 0, col_start: 4, col_end: 6 },
-                UnderlineSeg { page: 0, row: 1, col_start: 0, col_end: 6 },
-                UnderlineSeg { page: 1, row: 0, col_start: 0, col_end: 4 },
+                UnderlineSeg { page: 0, row: 0, start_em: 2000, end_em: 3000 },
+                UnderlineSeg { page: 0, row: 1, start_em: 0, end_em: 3000 },
+                UnderlineSeg { page: 1, row: 0, start_em: 0, end_em: 2000 },
             ]
         );
     }
 
     #[test]
-    fn underline_columns_account_for_narrow_latin() {
-        let pages = paginate("ab一二", 6, 2);
-        // Underline the "一" — it starts after two 1-column chars.
+    fn underline_offsets_follow_real_latin_widths() {
+        // The old model gave every Latin character half an em; now the
+        // run starts wherever "ab" actually ends in this font.
+        let pages = paginate("ab一二", 3000, 2);
         let segs = underline_segments(&pages, 2, 1);
-        assert_eq!(segs, vec![UnderlineSeg { page: 0, row: 0, col_start: 2, col_end: 4 }]);
+        let ab = crate::metrics::advance('a') + crate::metrics::advance('b');
+        assert_eq!(segs, vec![UnderlineSeg { page: 0, row: 0, start_em: ab, end_em: ab + 1000 }]);
+        assert_ne!(ab, 1000, "a+b should not coincidentally equal one em");
     }
 
     #[test]
     fn build_assigns_absolute_pages_across_chapters() {
-        let grid = Grid { cols: 6, lines_per_page: 2, ..Grid::default() };
-        let c1 = ChapterInput { pages: paginate("一二三四五六七", 6, 2), ..chapter(1, "一二三四五六七", vec![]) };
-        let c2 = ChapterInput { pages: paginate("八九", 6, 2), ..chapter(2, "八九", vec![]) };
+        let grid = Grid { text_em: 3000, lines_per_page: 2, ..Grid::default() };
+        let c1 = ChapterInput { pages: paginate("一二三四五六七", 3000, 2), ..chapter(1, "一二三四五六七", vec![]) };
+        let c2 = ChapterInput { pages: paginate("八九", 3000, 2), ..chapter(2, "八九", vec![]) };
         let l = build("b", "t", "a", &[c1, c2], grid, false);
         assert_eq!(l.chapters[0].page_start, 0);
         assert_eq!(l.chapters[0].page_count, 2);
@@ -502,10 +500,10 @@ mod tests {
 
     #[test]
     fn taps_follow_text_order_and_are_hit_testable() {
-        let grid = Grid { cols: 6, lines_per_page: 2, ..Grid::default() };
+        let grid = Grid { text_em: 3000, lines_per_page: 2, ..Grid::default() };
         let text = "一二三四五六七八九十";
         let c = ChapterInput {
-            pages: paginate(text, grid.cols, grid.lines_per_page),
+            pages: paginate(text, grid.text_em, grid.lines_per_page),
             // CJK is 2 columns wide, so cols:6 holds 3 chars per line
             // and a page holds 6 — both underlines have to start inside
             // that first page for this to be about ordering rather than
@@ -530,10 +528,10 @@ mod tests {
     fn a_wrapped_range_yields_one_tap_per_line_sharing_the_range() {
         // cols:6 with 2-column CJK holds 3 chars per line, so a 4-char
         // underline starting mid-line necessarily wraps.
-        let grid = Grid { cols: 6, lines_per_page: 2, ..Grid::default() };
+        let grid = Grid { text_em: 3000, lines_per_page: 2, ..Grid::default() };
         let text = "一二三四五六";
         let c = ChapterInput {
-            pages: paginate(text, grid.cols, grid.lines_per_page),
+            pages: paginate(text, grid.text_em, grid.lines_per_page),
             ..chapter(1, text, vec![hot("7-8", 2, 3, 42)])
         };
         let l = build("b", "t", "a", &[c], grid, false);
@@ -552,10 +550,10 @@ mod tests {
         // digits capped a chapter at 20 tap targets, so a real book
         // (《球状闪电》: 840 hot underlines, 151 in one chapter) left
         // 62% of its underlines dead. Nothing is capped now.
-        let grid = Grid { cols: 60, lines_per_page: 20, ..Grid::default() };
+        let grid = Grid { text_em: 30000, lines_per_page: 20, ..Grid::default() };
         let text: String = "一二三四五六七八九十".repeat(100);
         let hots: Vec<HotInput> = (0..151).map(|i| hot(&format!("r{i}"), i * 4, 2, 10)).collect();
-        let c = ChapterInput { pages: paginate(&text, grid.cols, grid.lines_per_page), ..chapter(1, &text, hots) };
+        let c = ChapterInput { pages: paginate(&text, grid.text_em, grid.lines_per_page), ..chapter(1, &text, hots) };
         let l = build("b", "t", "a", &[c], grid, false);
 
         assert_eq!(l.chapters[0].hot.len(), 151);
@@ -595,9 +593,9 @@ mod tests {
 
     #[test]
     fn layout_json_roundtrips() {
-        let grid = Grid { cols: 6, lines_per_page: 2, ..Grid::default() };
+        let grid = Grid { text_em: 3000, lines_per_page: 2, ..Grid::default() };
         let text = "一二三四五";
-        let c = ChapterInput { pages: paginate(text, 6, 2), ..chapter(1, text, vec![hot("1-2", 0, 2, 3)]) };
+        let c = ChapterInput { pages: paginate(text, 3000, 2), ..chapter(1, text, vec![hot("1-2", 0, 2, 3)]) };
         let l = build("b", "题", "作者", &[c], grid, false);
         let json = serde_json::to_string(&l).unwrap();
         let back: BookLayout = serde_json::from_str(&json).unwrap();

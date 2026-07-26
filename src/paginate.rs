@@ -2,9 +2,14 @@
 //!
 //! Narrow on purpose (design.md §"不重复造轮子"): this only has to lay
 //! out WeRead chapter prose on a fixed-size e-ink screen, not implement a
-//! general reflow engine. No fonts, no metrics, no hyphenation — just a
-//! character-grid model, which is what CJK prose on a fixed screen
-//! actually is.
+//! general reflow engine. No hyphenation, no justification, no bidi.
+//!
+//! It does consult font metrics, though it once didn't: the original
+//! character-grid model gave every CJK glyph two columns and everything
+//! else one, which is true of CJK prose and wrong for Latin — an English
+//! book came out visibly ragged, letters squeezed and craters after the
+//! punctuation. Widths now come from `metrics`, the same source pdfgen
+//! and layout use, in 1/1000 em.
 //!
 //! Each page keeps the character range it covers, so a tap on screen can
 //! be mapped back through `xhtml::Text::source_offset` to a raw-HTML
@@ -28,47 +33,19 @@ pub struct Page {
 /// Rough width of one character in "columns", where a CJK glyph is 2 and
 /// a Latin one is 1 — the standard monospace-ish approximation, and close
 /// enough for a fixed-width e-ink layout.
-/// Grid columns a character occupies: 2 for full-width, 1 otherwise.
+/// Advance width of `c`, in 1/1000 em — see `metrics`.
 ///
-/// This must agree with what the embedded font actually draws, or the
-/// PDF squeezes a full-width glyph into a half-width cell and the text
-/// after it is dragged left. The ranges below are the CJK blocks, plus
-/// the handful of "East Asian Ambiguous" punctuation marks that Noto
-/// Sans CJK renders full-width even though their codepoints sit in the
-/// Latin/General-Punctuation blocks — curly quotes were the ones that
-/// showed up as visibly wrong on a real page.
-///
-/// Latin letters and ASCII punctuation deliberately do *not* match
-/// their natural advances: the grid gives them a half-width cell and
-/// pdfgen kerns them into it. That is the character-grid design, not a
-/// mismatch. `pdfgen`'s `grid_widths_match_the_font` test encodes
-/// exactly this distinction.
-pub fn char_width(c: char) -> usize {
-    let cp = c as u32;
-    let wide = matches!(cp,
-        0x1100..=0x115F      // Hangul Jamo
-        | 0x2E80..=0xA4CF    // CJK radicals, kana, CJK ideographs
-        | 0xAC00..=0xD7A3    // Hangul syllables
-        | 0xF900..=0xFAFF    // CJK compatibility ideographs
-        | 0xFE30..=0xFE6F    // CJK compatibility forms
-        | 0xFF00..=0xFF60    // Fullwidth forms
-        | 0xFFE0..=0xFFE6
-        | 0x20000..=0x3FFFD  // CJK extensions
-        // Full-width in CJK fonts despite living outside the CJK blocks:
-        | 0x00B7             // · middle dot
-        | 0x2014..=0x2015    // — ― dashes
-        | 0x2018..=0x2019    // ‘ ’
-        | 0x201C..=0x201D    // “ ”
-        | 0x2026             // … ellipsis
-    );
-    if wide { 2 } else { 1 }
+/// Kept as a thin alias so callers read naturally; the single source of
+/// truth is the embedded font.
+pub fn char_units(c: char) -> u32 {
+    crate::metrics::advance(c)
 }
 
 /// True where a line may break *before* `c` without splitting a word.
 /// CJK breaks anywhere; Latin only at spaces (handled by the caller
 /// tracking the last space).
 fn is_cjk(c: char) -> bool {
-    char_width(c) == 2
+    crate::metrics::is_full_width(c)
 }
 
 /// Characters that must not start a line (CJK closing punctuation) —
@@ -78,10 +55,10 @@ fn forbidden_at_line_start(c: char) -> bool {
     matches!(c, '，' | '。' | '、' | '；' | '：' | '？' | '！' | '”' | '’' | '》' | '）' | '】' | '」' | '』' | '·' | '…' | ',' | '.' | ';' | ':' | '?' | '!' | ')' | ']' | '}')
 }
 
-/// Wraps one paragraph into lines of at most `width` columns. Returns
-/// each line's text plus the character offset (relative to the
+/// Wraps one paragraph into lines no wider than `width` (1/1000 em).
+/// Returns each line's text plus the character offset (relative to the
 /// paragraph's start) where it begins.
-fn wrap_paragraph(paragraph: &str, width: usize) -> Vec<(String, usize)> {
+fn wrap_paragraph(paragraph: &str, width: u32) -> Vec<(String, usize)> {
     let chars: Vec<char> = paragraph.chars().collect();
     if chars.is_empty() {
         return vec![(String::new(), 0)];
@@ -90,15 +67,15 @@ fn wrap_paragraph(paragraph: &str, width: usize) -> Vec<(String, usize)> {
     let mut lines = Vec::new();
     let mut line_start = 0usize;
     let mut cursor = 0usize;
-    let mut columns = 0usize;
+    let mut used = 0u32;
     // Where the current line could break at a space, if it has to.
     let mut last_space: Option<usize> = None;
 
     while cursor < chars.len() {
         let c = chars[cursor];
-        let w = char_width(c);
+        let w = char_units(c);
 
-        if columns + w > width && cursor > line_start {
+        if used + w > width && cursor > line_start {
             // Prefer breaking at a space for Latin runs; CJK can break
             // right here. Never break *before* closing punctuation.
             // A space landing exactly on the boundary is itself the
@@ -123,7 +100,7 @@ fn wrap_paragraph(paragraph: &str, width: usize) -> Vec<(String, usize)> {
             }
             line_start = next_start;
             cursor = next_start;
-            columns = 0;
+            used = 0;
             last_space = None;
             continue;
         }
@@ -131,7 +108,7 @@ fn wrap_paragraph(paragraph: &str, width: usize) -> Vec<(String, usize)> {
         if c == ' ' {
             last_space = Some(cursor);
         }
-        columns += w;
+        used += w;
         cursor += 1;
     }
 
@@ -142,9 +119,9 @@ fn wrap_paragraph(paragraph: &str, width: usize) -> Vec<(String, usize)> {
     lines
 }
 
-/// Lays `text` out into pages of `lines_per_page` lines, each at most
-/// `width` columns wide.
-pub fn paginate(text: &str, width: usize, lines_per_page: usize) -> Vec<Page> {
+/// Lays `text` out into pages of `lines_per_page` lines, each no wider
+/// than `width` (1/1000 em — see `metrics`).
+pub fn paginate(text: &str, width: u32, lines_per_page: usize) -> Vec<Page> {
     if width == 0 || lines_per_page == 0 {
         return Vec::new();
     }
@@ -184,28 +161,31 @@ mod tests {
 
     #[test]
     fn wraps_cjk_at_any_character() {
-        // width 6 columns = 3 CJK chars per line
-        let pages = paginate("一二三四五", 6, 10);
+        // 3 em of text = 3 CJK chars per line
+        let pages = paginate("一二三四五", 3000, 10);
         assert_eq!(pages[0].lines, vec!["一二三", "四五"]);
     }
 
     #[test]
     fn wraps_latin_at_spaces() {
-        let pages = paginate("hello world foo", 11, 10);
+        // Wide enough for "hello world" but not the next word — a
+        // width in em now, so it is measured from the font.
+        let width = crate::metrics::text_advance("hello world") + 100;
+        let pages = paginate("hello world foo", width, 10);
         assert_eq!(pages[0].lines, vec!["hello world", "foo"]);
     }
 
     #[test]
     fn does_not_start_a_line_with_closing_punctuation() {
         // Without the rule, "，" would be pushed to the next line.
-        let pages = paginate("一二三，四", 6, 10);
+        let pages = paginate("一二三，四", 3000, 10);
         assert_eq!(pages[0].lines[0], "一二");
         assert!(pages[0].lines[1].starts_with("三，"));
     }
 
     #[test]
     fn splits_into_pages_of_requested_height() {
-        let pages = paginate("一二三四五六七八九十", 2, 2);
+        let pages = paginate("一二三四五六七八九十", 1000, 2);
         // 1 CJK char per line, 2 lines per page => 5 pages
         assert_eq!(pages.len(), 5);
         assert_eq!(pages[0].lines, vec!["一", "二"]);
@@ -215,7 +195,7 @@ mod tests {
     #[test]
     fn page_ranges_are_contiguous_and_cover_everything() {
         let text = "第一段文字\n第二段文字\n第三段文字";
-        let pages = paginate(text, 4, 2);
+        let pages = paginate(text, 2000, 2);
         assert_eq!(pages[0].start, 0);
         for w in pages.windows(2) {
             assert_eq!(w[0].end, w[1].start, "page ranges must be contiguous");
@@ -225,13 +205,13 @@ mod tests {
 
     #[test]
     fn paragraph_breaks_start_new_lines() {
-        let pages = paginate("一\n二", 10, 10);
+        let pages = paginate("一\n二", 5000, 10);
         assert_eq!(pages[0].lines, vec!["一", "二"]);
     }
 
     #[test]
     fn empty_text_yields_one_empty_page() {
-        let pages = paginate("", 10, 10);
+        let pages = paginate("", 5000, 10);
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0].lines, vec![""]);
     }
@@ -239,6 +219,6 @@ mod tests {
     #[test]
     fn zero_dimensions_yield_no_pages() {
         assert!(paginate("abc", 0, 10).is_empty());
-        assert!(paginate("abc", 10, 0).is_empty());
+        assert!(paginate("abc", 5000, 0).is_empty());
     }
 }

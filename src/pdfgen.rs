@@ -147,23 +147,21 @@ fn utf16_hex(s: &str) -> String {
     out
 }
 
-/// One line of body text as a TJ array: glyph hex runs interleaved with
-/// kerning adjustments that force every character onto its grid column
-/// (adjustment = natural advance − desired advance, in 1/1000 em; a
-/// CJK glyph is 2 columns = 1000 units, so CJK runs need none and
-/// compress into plain hex runs). Also records used glyphs.
+/// One line of body text, as a single glyph run.
+///
+/// No kerning adjustments any more. They existed to drag every
+/// character onto a half-em grid column, which is right for CJK and
+/// wrong for Latin — `A` is 608 units and `.` is 278, and forcing both
+/// to 500 is what made English pages look ragged. Now `metrics` (the
+/// same font, the same numbers) is what pagination and layout measure
+/// with, so letting the glyphs fall at their natural advances puts them
+/// exactly where the layout says they are.
 fn line_tj(font: &FontInfo, text: &str, used: &mut BTreeMap<u16, char>) -> String {
     let mut tj = String::from("[<");
     for c in text.chars() {
         let gid = font.gid(c);
         used.entry(gid).or_insert(c);
-        let natural = font.advance(gid);
-        let desired = (crate::paginate::char_width(c) * 500) as i32;
         let _ = write!(tj, "{gid:04X}");
-        let adj = natural - desired;
-        if adj != 0 {
-            let _ = write!(tj, ">{adj}<");
-        }
     }
     tj.push_str(">] TJ");
     tj
@@ -326,8 +324,8 @@ fn page_content(
                 continue;
             }
             let y = layout::PAGE_H_PT - grid.baseline_pt(seg.row) - 3.0;
-            let x0 = grid.col_x_pt(seg.col_start);
-            let x1 = grid.col_x_pt(seg.col_end);
+            let x0 = grid.x_pt(seg.start_em);
+            let x1 = grid.x_pt(seg.end_em);
             let _ = writeln!(
                 s,
                 "q {gray:.2} G {width:.2} w {dash} {x0:.2} {y:.2} m {x1:.2} {y:.2} l S Q"
@@ -769,7 +767,7 @@ mod tests {
     use crate::paginate::paginate;
 
     fn small_book() -> (BookLayout, Vec<ChapterInput>) {
-        let grid = Grid { cols: 10, lines_per_page: 4, ..Grid::default() };
+        let grid = Grid { text_em: 5000, lines_per_page: 4, ..Grid::default() };
         let text1 = "第一章的正文，有一句被很多人划过的话。";
         let text2 = "第二章 short mixed 内容。";
         let chapters = vec![
@@ -777,14 +775,14 @@ mod tests {
                 chapter_uid: 11,
                 title: "第一章".into(),
                 text: text1.into(),
-                pages: paginate(text1, grid.cols, grid.lines_per_page),
+                pages: paginate(text1, grid.text_em, grid.lines_per_page),
                 hot: vec![HotInput { range: "10-20".into(), off: 8, len: 6, count: 1234 }],
             },
             ChapterInput {
                 chapter_uid: 12,
                 title: "第二章".into(),
                 text: text2.into(),
-                pages: paginate(text2, grid.cols, grid.lines_per_page),
+                pages: paginate(text2, grid.text_em, grid.lines_per_page),
                 hot: vec![],
             },
         ];
@@ -853,13 +851,13 @@ mod tests {
 
     #[test]
     fn a_cover_adds_page_zero_and_embeds_the_jpeg_verbatim() {
-        let grid = Grid { cols: 10, lines_per_page: 4, ..Grid::default() };
+        let grid = Grid { text_em: 5000, lines_per_page: 4, ..Grid::default() };
         let text = "正文正文正文";
         let chapters = vec![ChapterInput {
             chapter_uid: 1,
             title: "一".into(),
             text: text.into(),
-            pages: crate::paginate::paginate(text, grid.cols, grid.lines_per_page),
+            pages: crate::paginate::paginate(text, grid.text_em, grid.lines_per_page),
             hot: vec![],
         }];
         let plain = build("b", "书名", "作者", &chapters, grid, false);
@@ -892,13 +890,13 @@ mod tests {
     fn a_cover_page_still_exists_when_the_artwork_is_unusable() {
         // Otherwise a failed download would silently change the page
         // count, i.e. the geometry, on a decoration refresh.
-        let grid = Grid { cols: 10, lines_per_page: 4, ..Grid::default() };
+        let grid = Grid { text_em: 5000, lines_per_page: 4, ..Grid::default() };
         let text = "正文";
         let chapters = vec![ChapterInput {
             chapter_uid: 1,
             title: "一".into(),
             text: text.into(),
-            pages: crate::paginate::paginate(text, grid.cols, grid.lines_per_page),
+            pages: crate::paginate::paginate(text, grid.text_em, grid.lines_per_page),
             hot: vec![],
         }];
         let l = build("b", "书名", "作者", &chapters, grid, true);
@@ -921,30 +919,22 @@ mod tests {
     }
 
     #[test]
-    fn grid_widths_match_the_font() {
-        // A full-width glyph squeezed into a half-width cell drags the
-        // rest of the line left — this is how the curly quotes ended up
-        // visibly wrong on a real page. Anything the font draws at a
-        // full em must be two columns.
+    fn glyphs_are_drawn_at_the_widths_the_layout_measured() {
+        // pdfgen no longer kerns anything onto a grid, so the only way
+        // underlines can sit under the right words is if `metrics` —
+        // what paginate and layout measure with — reports exactly what
+        // this font draws.
         let font = FontInfo::parse(FONT).unwrap();
-        let full_em: Vec<char> = "“”‘’…·、。，！？：；（）《》「」【】一書".chars().collect();
-        for c in full_em {
+        for c in "“”‘’…·、。，！？（）《》「」一書aAiW,.!?".chars() {
             assert_eq!(
+                crate::metrics::advance(c) as i32,
                 font.advance(font.gid(c)),
-                1000,
-                "test assumes U+{:04X} {c} is full-width in this font",
+                "metrics and the font disagree about U+{:04X} {c}",
                 c as u32
             );
-            assert_eq!(crate::paginate::char_width(c), 2, "U+{:04X} {c} must be 2 columns", c as u32);
         }
-
-        // Latin is the deliberate exception: the grid gives it a
-        // half-width cell and line_tj kerns it in, so its natural
-        // advance is *expected* to differ.
-        for c in "aA,.!?".chars() {
-            assert_eq!(crate::paginate::char_width(c), 1);
-            assert_ne!(font.advance(font.gid(c)), 1000);
-        }
+        // And Latin really is proportional now.
+        assert_ne!(crate::metrics::advance('i'), crate::metrics::advance('W'));
     }
 
     #[test]
