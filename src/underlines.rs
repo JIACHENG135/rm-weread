@@ -202,19 +202,34 @@ pub fn fetch_reviews(
 /// Maps source-XHTML underline ranges onto plain-text offsets for the
 /// layout. Ranges that don't intersect any retained text are dropped.
 pub fn map_to_text(underlines: &[Underline], text: &xhtml::Text) -> Vec<crate::layout::HotInput> {
+    let chars: Vec<char> = text.text.chars().collect();
     let mut out = Vec::new();
     for u in underlines {
         let Some(start) = text.out_offset_for_source(u.src_start) else { continue };
-        // The end is inclusive in WeRead's convention: map the last
-        // included character, then extend by one.
-        let Some(end_incl) = text.out_offset_for_source(u.src_end) else { continue };
-        if end_incl < start {
+        // `src_end` maps to the first character *past* the run, not the
+        // last one in it. Checked against WeRead's own `abstract` for
+        // range 621-670 of 球状闪电: treating it as inclusive and adding
+        // one drew two characters too many, and the second of them was
+        // the first character of the *next paragraph*.
+        let Some(end) = text.out_offset_for_source(u.src_end) else { continue };
+        if end <= start {
+            continue;
+        }
+        // `to_text` inserts paragraph breaks that have no counterpart in
+        // the source, so a mapped end can land just past one. An
+        // underline that runs through a line break draws a stray cell at
+        // the end of the line.
+        let mut end = end.min(chars.len());
+        while end > start && chars[end - 1].is_whitespace() {
+            end -= 1;
+        }
+        if end <= start {
             continue;
         }
         out.push(crate::layout::HotInput {
             range: u.range.clone(),
             off: start,
-            len: end_incl - start + 1,
+            len: end - start,
             count: u.count,
         });
     }
@@ -339,13 +354,45 @@ mod tests {
     #[test]
     fn maps_source_ranges_to_text_offsets() {
         let t = crate::xhtml::to_text("<p>abcde</p>");
-        // 'a' is at source 3; range "3-5" covers abc inclusive.
+        // 'a' is at source 3, and WeRead's end is exclusive: "3-5"
+        // covers "ab". Checked against the `abstract` the review API
+        // returns for a real range rather than assumed — reading it as
+        // inclusive drew a character too many on every underline.
         let hot = map_to_text(
             &[Underline { range: "3-5".into(), src_start: 3, src_end: 5, count: 2 }],
             &t,
         );
         assert_eq!(hot.len(), 1);
-        assert_eq!((hot[0].off, hot[0].len, hot[0].count), (0, 3, 2));
+        assert_eq!((hot[0].off, hot[0].len, hot[0].count), (0, 2, 2));
+    }
+
+    #[test]
+    fn an_underline_never_runs_through_a_paragraph_break() {
+        // to_text inserts a break between paragraphs that has no source
+        // counterpart, so a mapped end can land past it — and then the
+        // run trails a blank cell and swallows the next paragraph's
+        // first character. This is what made underlines look one
+        // character too long on a real page.
+        let t = crate::xhtml::to_text("<p>ab</p><p>cd</p>");
+        assert_eq!(t.text, "ab
+cd");
+        let src_end = t.text.len(); // safely past "ab" and the break
+        let hot = map_to_text(
+            &[Underline { range: "r".into(), src_start: 3, src_end, count: 1 }],
+            &t,
+        );
+        let h = &hot[0];
+        let covered: String = t.text.chars().skip(h.off).take(h.len).collect();
+        assert!(!covered.ends_with(char::is_whitespace), "trailing break in {covered:?}");
+        assert!(covered.starts_with("ab"));
+    }
+
+    #[test]
+    fn a_range_that_maps_to_nothing_is_dropped() {
+        let t = crate::xhtml::to_text("<p>ab</p>");
+        // Zero-width and inverted ranges must not become underlines.
+        assert!(map_to_text(&[Underline { range: "z".into(), src_start: 3, src_end: 3, count: 1 }], &t).is_empty());
+        assert!(map_to_text(&[Underline { range: "z".into(), src_start: 5, src_end: 3, count: 1 }], &t).is_empty());
     }
 
     #[test]

@@ -21,3 +21,10 @@ urlencoding = "2"
 # compresses PDF content streams and the embedded font file.
 ttf-parser = "0.25"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+# The daemon is a release download now, and it carries a 7MB embedded
+# font, so size is worth a little link time.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"

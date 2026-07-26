@@ -214,6 +214,46 @@ fn with_retry<T>(
     Err(last.unwrap_or_else(|| "unknown error".into()))
 }
 
+/// The QML popup needs a CJK face on disk, and this device ships none:
+/// /usr/share/fonts holds Latin Noto only. The binary already embeds the
+/// font it draws PDFs with, so write that same file out rather than
+/// making the installer fetch one — it also guarantees the popup and the
+/// page are set in the same typeface.
+fn ensure_qml_font(paths: &Paths) {
+    let dest = paths.exthome.join("NotoSansSC.ttf");
+    if fs::metadata(&dest).map(|m| m.len() as usize == pdfgen::FONT.len()).unwrap_or(false) {
+        return;
+    }
+    let tmp = dest.with_extension("ttf.tmp");
+    match fs::write(&tmp, pdfgen::FONT).and_then(|_| fs::rename(&tmp, &dest)) {
+        Ok(()) => println!("weread: installed the QML font at {}", dest.display()),
+        Err(e) => eprintln!("weread: could not install the QML font: {e}"),
+    }
+}
+
+/// Points fontconfig at that font, so xochitl's *own* library view can
+/// render the Chinese document names this project creates.
+///
+/// It goes under /home/root because /etc is an overlay on tmpfs on this
+/// firmware — wiped every reboot — and / is read-only. Only written when
+/// absent: the reader's fontconfig is theirs.
+fn ensure_fontconfig(paths: &Paths) {
+    let dir = std::path::Path::new("/home/root/.config/fontconfig");
+    let dest = dir.join("fonts.conf");
+    if dest.exists() {
+        return;
+    }
+    let conf = format!(
+        "<?xml version=\"1.0\"?>\n<!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">\n\
+         <fontconfig>\n  <dir>{}</dir>\n  <alias>\n    <family>sans-serif</family>\n\
+         \x20   <prefer><family>Noto Sans SC</family></prefer>\n  </alias>\n</fontconfig>\n",
+        paths.exthome.display()
+    );
+    if fs::create_dir_all(dir).and_then(|_| fs::write(&dest, conf)).is_ok() {
+        println!("weread: installed {} so the library can render Chinese titles", dest.display());
+    }
+}
+
 /// Makes sure the "＋ 书架" card exists in the folder and tells QML its
 /// uuid, so opening that document pops the shelf browser.
 fn ensure_shelf_card(paths: &Paths) {
@@ -389,6 +429,8 @@ fn main() {
     // previous run would draw lines for a book that may since have been
     // regenerated with different geometry.
     let _ = fs::remove_dir_all(paths.exthome.join("hot"));
+    ensure_qml_font(&paths);
+    ensure_fontconfig(&paths);
     ensure_shelf_card(&paths);
     if !exthome().join("gen.txt").exists() {
         gen_status("done", "(空闲)");
