@@ -58,6 +58,55 @@ fn underline_style(count: u32) -> (f32, &'static str, f32) {
     }
 }
 
+/// Width, height and colour-component count read out of a JPEG's SOF
+/// marker.
+///
+/// JPEG is the only cover format handled, and deliberately so: PDF's
+/// DCTDecode filter takes JPEG entrypoint bytes *verbatim*, so a cover
+/// costs one stream copy and no decoder, no new dependency, and no
+/// re-encoding artifacts. WeRead serves real book covers as JPEG from
+/// cdn.weread.qq.com (the PNGs on the shelf belong to audiobook albums
+/// and the "my articles" pseudo-entry, neither of which we generate).
+/// Anything else falls back to a text-only cover page.
+fn jpeg_info(data: &[u8]) -> Option<(u32, u32, u8)> {
+    if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
+        return None;
+    }
+    let mut i = 2usize;
+    while i + 3 < data.len() {
+        if data[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = data[i + 1];
+        // Standalone markers: no length, no payload.
+        if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            i += 2;
+            continue;
+        }
+        // Start of scan — past every header we care about.
+        if marker == 0xDA || marker == 0xD9 {
+            return None;
+        }
+        let len = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
+        // SOF0/1/2/3, 5/6/7, 9/10/11, 13/14/15 all carry the same frame
+        // header shape; DHT(C4)/JPG(C8)/DAC(CC) share the range but not
+        // the layout, so they're excluded explicitly.
+        let is_sof = (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC;
+        if is_sof {
+            if i + 9 >= data.len() {
+                return None;
+            }
+            let h = u16::from_be_bytes([data[i + 5], data[i + 6]]) as u32;
+            let w = u16::from_be_bytes([data[i + 7], data[i + 8]]) as u32;
+            let comps = data[i + 9];
+            return (w > 0 && h > 0).then_some((w, h, comps));
+        }
+        i += 2 + len;
+    }
+    None
+}
+
 struct FontInfo<'a> {
     face: Face<'a>,
     /// Advance widths in 1/1000 em (PDF text space units).
@@ -145,6 +194,87 @@ fn show_text_at(
 fn text_width(font: &FontInfo, size: f32, text: &str) -> f32 {
     let units: i32 = text.chars().map(|c| font.advance(font.gid(c))).sum();
     units as f32 / 1000.0 * size
+}
+
+/// Widest the cover artwork is drawn, in points.
+///
+/// Not a full-bleed page on purpose. WeRead's largest cover variant is
+/// only ~428×616, and the page is 702×936pt rendering at ~2.3 device
+/// px/pt, so filling the page would mean a >3× upscale — mush on e-ink.
+/// At this width it's ~1.8×, which artwork tolerates, and the result
+/// reads as a title page rather than a stretched bitmap.
+const COVER_MAX_W_PT: f32 = 340.0;
+
+/// Gap between the artwork and the title baseline, and between title
+/// and author. Used both to draw and to centre the whole block.
+const COVER_TITLE_GAP_PT: f32 = 64.0;
+const COVER_AUTHOR_GAP_PT: f32 = 44.0;
+
+/// The title page: artwork centred in the upper half over a hairline
+/// frame, then title and author. Falls back to type alone when there is
+/// no usable image, so the page count never depends on whether the
+/// download worked (which would be a geometry change — see
+/// `layout::content_hash`).
+fn cover_content(
+    font: &FontInfo,
+    used: &mut BTreeMap<u16, char>,
+    title: &str,
+    author: &str,
+    image: Option<(u32, u32)>,
+) -> Vec<u8> {
+    let mut s = String::new();
+    let mut text_top = layout::PAGE_H_PT * 0.46;
+
+    if let Some((iw, ih)) = image {
+        let w = COVER_MAX_W_PT.min(iw as f32);
+        let h = w * ih as f32 / iw as f32;
+        let x = (layout::PAGE_W_PT - w) / 2.0;
+        // Centre the whole artwork-plus-type block rather than the
+        // artwork alone, so the page doesn't sit high with a pool of
+        // white underneath it.
+        let block = h + COVER_TITLE_GAP_PT + 34.0 + if author.is_empty() { 0.0 } else { COVER_AUTHOR_GAP_PT };
+        let y = (layout::PAGE_H_PT + block) / 2.0 - h;
+
+        // Hairline frame plus a solid offset rim — the same "depth
+        // without transparency" trick the QML popup uses, for the same
+        // reason: e-ink dithers translucency into speckle.
+        let _ = writeln!(s, "q 0.85 G 1 w {:.2} {:.2} {w:.2} {h:.2} re S Q", x + 3.0, y - 3.0);
+        // An image XObject draws into the unit square, so the CTM is
+        // what sizes and places it.
+        let _ = writeln!(s, "q {w:.2} 0 0 {h:.2} {x:.2} {y:.2} cm /Im0 Do Q");
+        let _ = writeln!(s, "q 0.6 G 0.8 w {x:.2} {y:.2} {w:.2} {h:.2} re S Q");
+        text_top = y - COVER_TITLE_GAP_PT;
+    }
+
+    let tw = text_width(font, 34.0, title).min(layout::PAGE_W_PT - 120.0);
+    s.push_str(&show_text_at(
+        font,
+        used,
+        34.0,
+        (layout::PAGE_W_PT - tw) / 2.0,
+        text_top,
+        0.1,
+        title,
+    ));
+    if !author.is_empty() {
+        let aw = text_width(font, 20.0, author);
+        s.push_str(&show_text_at(
+            font,
+            used,
+            20.0,
+            (layout::PAGE_W_PT - aw) / 2.0,
+            text_top - COVER_AUTHOR_GAP_PT,
+            0.45,
+            author,
+        ));
+    }
+
+    // Quiet provenance line in the bottom margin.
+    let mark = "微信读书";
+    let mw = text_width(font, 12.0, mark);
+    s.push_str(&show_text_at(font, used, 12.0, (layout::PAGE_W_PT - mw) / 2.0, 60.0, 0.6, mark));
+
+    s.into_bytes()
 }
 
 /// Renders one page's content stream. `page_abs` is the 0-based
@@ -274,14 +404,15 @@ impl Pdf {
 
 /// Generates the whole-book PDF matching `layout` (which must have been
 /// built from these same `chapters` — same order, same pages).
-pub fn generate(book: &BookLayout, chapters: &[ChapterInput]) -> Result<Vec<u8>, String> {
-    generate_with_font(book, chapters, FONT)
+pub fn generate(book: &BookLayout, chapters: &[ChapterInput], cover_jpeg: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    generate_with_font(book, chapters, FONT, cover_jpeg)
 }
 
 pub fn generate_with_font(
     book: &BookLayout,
     chapters: &[ChapterInput],
     font_data: &[u8],
+    cover_jpeg: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
     if book.chapters.len() != chapters.len() {
         return Err("layout/chapter count mismatch".into());
@@ -300,8 +431,25 @@ pub fn generate_with_font(
     let tounicode_id = pdf.alloc();
     let outlines_id = pdf.alloc();
     let outline_ids: Vec<usize> = chapters.iter().map(|_| pdf.alloc()).collect();
-    // Page and content ids, chapter by chapter.
+
+    // Only usable JPEG data earns an image; the cover *page* exists or
+    // not purely by `book.cover`, because that is what the frozen page
+    // numbering was built from.
+    let cover_image = book
+        .cover
+        .then_some(cover_jpeg)
+        .flatten()
+        .and_then(|d| jpeg_info(d).map(|info| (d, info)))
+        .filter(|(_, (_, _, comps))| matches!(comps, 1 | 3));
+    let image_id = cover_image.is_some().then(|| pdf.alloc());
+
+    // Page and content ids: the cover first, then chapter by chapter.
     let mut page_ids = Vec::new();
+    if book.cover {
+        let p = pdf.alloc();
+        let c = pdf.alloc();
+        page_ids.push((p, c));
+    }
     for c in chapters {
         for _ in &c.pages {
             let p = pdf.alloc();
@@ -317,6 +465,47 @@ pub fn generate_with_font(
     // ---- Pages + content ----
     let mut used: BTreeMap<u16, char> = BTreeMap::new();
     let mut page_cursor = 0usize;
+
+    if book.cover {
+        let (page_id, content_id) = page_ids[0];
+        let content = cover_content(
+            &font,
+            &mut used,
+            &book.title,
+            &book.author,
+            cover_image.map(|(_, (w, h, _))| (w, h)),
+        );
+        pdf.set(content_id, Pdf::stream("", flate(&content)));
+        let xobject = match image_id {
+            Some(id) => format!(" /XObject << /Im0 {id} 0 R >>"),
+            None => String::new(),
+        };
+        pdf.set(
+            page_id,
+            format!(
+                "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {} {}] \
+                 /Resources << /Font << /F1 {type0_id} 0 R >>{xobject} >> /Contents {content_id} 0 R >>",
+                layout::PAGE_W_PT,
+                layout::PAGE_H_PT
+            )
+            .into_bytes(),
+        );
+        if let (Some(id), Some((data, (w, h, comps)))) = (image_id, cover_image) {
+            // DCTDecode takes the JPEG bytes as-is — no decode, no
+            // re-encode, no dependency.
+            let cs = if comps == 1 { "/DeviceGray" } else { "/DeviceRGB" };
+            let mut obj = format!(
+                "<< /Type /XObject /Subtype /Image /Width {w} /Height {h} /ColorSpace {cs} \
+                 /BitsPerComponent 8 /Filter /DCTDecode /Length {} >>\nstream\n",
+                data.len()
+            )
+            .into_bytes();
+            obj.extend_from_slice(data);
+            obj.extend_from_slice(b"\nendstream");
+            pdf.set(id, obj);
+        }
+        page_cursor = 1;
+    }
     for (ci, chapter) in chapters.iter().enumerate() {
         // Draw straight from the frozen layout's hot list: it already
         // carries range/off/len/count in a deterministic order, which
@@ -498,14 +687,14 @@ mod tests {
                 hot: vec![],
             },
         ];
-        let layout = build("book1", "测试书", "作者", &chapters, grid);
+        let layout = build("book1", "测试书", "作者", &chapters, grid, false);
         (layout, chapters)
     }
 
     #[test]
     fn generates_a_structurally_sound_pdf() {
         let (layout, chapters) = small_book();
-        let pdf = generate(&layout, &chapters).unwrap();
+        let pdf = generate(&layout, &chapters, None).unwrap();
         let head = &pdf[..8.min(pdf.len())];
         assert_eq!(head, b"%PDF-1.6");
         let tail = String::from_utf8_lossy(&pdf[pdf.len() - 200..]);
@@ -520,7 +709,7 @@ mod tests {
         // Work on raw bytes: the PDF contains binary streams, so
         // lossy-UTF8 string indices would drift from byte offsets.
         let (layout, chapters) = small_book();
-        let pdf = generate(&layout, &chapters).unwrap();
+        let pdf = generate(&layout, &chapters, None).unwrap();
         let tail = String::from_utf8_lossy(&pdf[pdf.len() - 100..]);
         let xref_at: usize = tail
             .split("startxref\n")
@@ -540,10 +729,89 @@ mod tests {
     }
 
     #[test]
+    fn jpeg_dimensions_come_from_the_sof_marker() {
+        // Minimal JPEG: SOI, an APP0 that must be skipped by length,
+        // then SOF0 declaring 428x616, 3 components.
+        let mut d = vec![0xFF, 0xD8];
+        d.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00]); // APP0, len 4
+        d.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08]);
+        d.extend_from_slice(&616u16.to_be_bytes());
+        d.extend_from_slice(&428u16.to_be_bytes());
+        d.push(3);
+        assert_eq!(jpeg_info(&d), Some((428, 616, 3)));
+
+        // DHT lives in the 0xC0..0xCF range but is not a frame header.
+        let mut n = vec![0xFF, 0xD8];
+        n.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x04, 0x00, 0x00]);
+        n.extend_from_slice(&[0xFF, 0xDA]); // start of scan, no SOF seen
+        assert_eq!(jpeg_info(&n), None);
+
+        assert_eq!(jpeg_info(b"not a jpeg at all"), None);
+        assert_eq!(jpeg_info(&[]), None);
+    }
+
+    #[test]
+    fn a_cover_adds_page_zero_and_embeds_the_jpeg_verbatim() {
+        let grid = Grid { cols: 10, lines_per_page: 4, ..Grid::default() };
+        let text = "正文正文正文";
+        let chapters = vec![ChapterInput {
+            chapter_uid: 1,
+            title: "一".into(),
+            text: text.into(),
+            pages: crate::paginate::paginate(text, grid.cols, grid.lines_per_page),
+            hot: vec![],
+        }];
+        let plain = build("b", "书名", "作者", &chapters, grid, false);
+        let with_cover = build("b", "书名", "作者", &chapters, grid, true);
+
+        // Page 0 is the cover, so the chapter starts one page later and
+        // the hash must differ — ink anchored to the old numbering would
+        // otherwise land a page off.
+        assert_eq!(with_cover.page_count, plain.page_count + 1);
+        assert_eq!(with_cover.chapters[0].page_start, plain.chapters[0].page_start + 1);
+        assert_ne!(with_cover.content_sha256, plain.content_sha256);
+
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08];
+        jpeg.extend_from_slice(&616u16.to_be_bytes());
+        jpeg.extend_from_slice(&428u16.to_be_bytes());
+        jpeg.push(3);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+
+        let pdf = generate(&with_cover, &chapters, Some(&jpeg)).unwrap();
+        let text_pdf = String::from_utf8_lossy(&pdf);
+        assert!(text_pdf.contains("/Subtype /Image"));
+        assert!(text_pdf.contains("/Filter /DCTDecode"));
+        assert!(text_pdf.contains("/Width 428"));
+        assert!(text_pdf.contains("/XObject << /Im0"));
+        // Verbatim passthrough: the exact bytes are in the file.
+        assert!(pdf.windows(jpeg.len()).any(|w| w == jpeg.as_slice()));
+    }
+
+    #[test]
+    fn a_cover_page_still_exists_when_the_artwork_is_unusable() {
+        // Otherwise a failed download would silently change the page
+        // count, i.e. the geometry, on a decoration refresh.
+        let grid = Grid { cols: 10, lines_per_page: 4, ..Grid::default() };
+        let text = "正文";
+        let chapters = vec![ChapterInput {
+            chapter_uid: 1,
+            title: "一".into(),
+            text: text.into(),
+            pages: crate::paginate::paginate(text, grid.cols, grid.lines_per_page),
+            hot: vec![],
+        }];
+        let l = build("b", "书名", "作者", &chapters, grid, true);
+        let pdf = generate(&l, &chapters, Some(b"definitely not a jpeg")).unwrap();
+        let s = String::from_utf8_lossy(&pdf);
+        assert!(!s.contains("/DCTDecode"));
+        assert!(s.contains(&format!("/Count {}", l.page_count)));
+    }
+
+    #[test]
     fn output_is_deterministic() {
         let (layout, chapters) = small_book();
-        let a = generate(&layout, &chapters).unwrap();
-        let b = generate(&layout, &chapters).unwrap();
+        let a = generate(&layout, &chapters, None).unwrap();
+        let b = generate(&layout, &chapters, None).unwrap();
         assert_eq!(a, b);
     }
 
@@ -565,11 +833,11 @@ mod tests {
             .collect();
         chapters_b[1].hot.push(HotInput { range: "5-6".into(), off: 0, len: 3, count: 5 });
         let grid = layout_a.grid;
-        let layout_b = build("book1", "测试书", "作者", &chapters_b, grid);
+        let layout_b = build("book1", "测试书", "作者", &chapters_b, grid, false);
         assert_eq!(layout_a.content_sha256, layout_b.content_sha256);
         assert_eq!(layout_a.page_count, layout_b.page_count);
-        let a = generate(&layout_a, &chapters_a).unwrap();
-        let b = generate(&layout_b, &chapters_b).unwrap();
+        let a = generate(&layout_a, &chapters_a, None).unwrap();
+        let b = generate(&layout_b, &chapters_b, None).unwrap();
         assert_ne!(a, b); // different decorations...
         assert_eq!(a.len().min(b.len()) > 1000, true);
     }
@@ -578,7 +846,7 @@ mod tests {
     fn refuses_mismatched_inputs() {
         let (layout, mut chapters) = small_book();
         chapters.pop();
-        assert!(generate(&layout, &chapters).is_err());
+        assert!(generate(&layout, &chapters, None).is_err());
     }
 
     #[test]

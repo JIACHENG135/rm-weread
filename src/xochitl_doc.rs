@@ -339,7 +339,7 @@ mod tests {
             pages: paginate(text, grid.cols, grid.lines_per_page),
             hot: vec![],
         }];
-        build("book9", "书名", "作者", &chapters, grid)
+        build("book9", "书名", "作者", &chapters, grid, false)
     }
 
     #[test]

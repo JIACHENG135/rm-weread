@@ -154,6 +154,9 @@ pub struct Tap {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BookLayout {
     pub v: u32,
+    /// Whether page 0 is a cover page rather than the first chapter.
+    #[serde(default)]
+    pub cover: bool,
     pub book_id: String,
     pub title: String,
     pub author: String,
@@ -232,10 +235,16 @@ pub fn underline_segments(pages: &[Page], off: usize, len: usize) -> Vec<Underli
 /// Content hash that freezes the geometry: decoded chapter texts plus
 /// every grid constant that influences layout. Any change here must
 /// open a new xochitl document.
-pub fn content_hash(chapters: &[ChapterInput], grid: &Grid) -> String {
+pub fn content_hash(chapters: &[ChapterInput], grid: &Grid, has_cover: bool) -> String {
     let mut h = Sha256::new();
+    // `has_cover` is in here because a cover occupies page 0 and pushes
+    // every chapter page along by one — that is a geometry change, and
+    // ink anchored to the old numbering would land on the wrong page.
+    // The cover *image bytes* deliberately are not: swapping artwork
+    // inside a fixed box moves nothing, so a new cover is allowed to
+    // ride in on a decoration refresh.
     h.update(format!(
-        "grid:{}:{}:{}:{}:{}:{}:{}x{}\n",
+        "cover:{has_cover}\ngrid:{}:{}:{}:{}:{}:{}:{}x{}\n",
         grid.font_pt,
         grid.margin_x_pt,
         grid.margin_top_pt,
@@ -270,11 +279,15 @@ pub fn build(
     author: &str,
     chapters: &[ChapterInput],
     grid: Grid,
+    has_cover: bool,
 ) -> BookLayout {
-    let content_sha256 = content_hash(chapters, &grid);
+    let content_sha256 = content_hash(chapters, &grid, has_cover);
     let mut out_chapters = Vec::new();
     let mut taps = Vec::new();
-    let mut page_cursor = 0usize;
+    // The cover, when there is one, is page 0; chapters start after it.
+    // Everything downstream (lines, taps, outline destinations) works in
+    // absolute pages, so this single offset is the whole change.
+    let mut page_cursor = usize::from(has_cover);
 
     for c in chapters {
         let mut lines = Vec::new();
@@ -332,6 +345,7 @@ pub fn build(
         // v2: tappable underline runs (`taps`) replaced the circled-digit
         // markers of v1. The QML popup reads this field name directly.
         v: 2,
+        cover: has_cover,
         book_id: book_id.to_string(),
         title: title.to_string(),
         author: author.to_string(),
@@ -447,7 +461,7 @@ mod tests {
         let grid = Grid { cols: 6, lines_per_page: 2, ..Grid::default() };
         let c1 = ChapterInput { pages: paginate("一二三四五六七", 6, 2), ..chapter(1, "一二三四五六七", vec![]) };
         let c2 = ChapterInput { pages: paginate("八九", 6, 2), ..chapter(2, "八九", vec![]) };
-        let l = build("b", "t", "a", &[c1, c2], grid);
+        let l = build("b", "t", "a", &[c1, c2], grid, false);
         assert_eq!(l.chapters[0].page_start, 0);
         assert_eq!(l.chapters[0].page_count, 2);
         assert_eq!(l.chapters[1].page_start, 2);
@@ -468,7 +482,7 @@ mod tests {
             // about the per-page numbering reset.
             ..chapter(1, text, vec![hot("30-40", 2, 2, 500), hot("10-20", 0, 2, 100)])
         };
-        let l = build("b", "t", "a", &[c], grid);
+        let l = build("b", "t", "a", &[c], grid, false);
         // Sorted by offset: "10-20" gets ①, "30-40" gets ②.
         assert_eq!(l.chapters[0].hot[0].range, "10-20");
         // Tapping the underlined glyphs themselves opens that range.
@@ -492,7 +506,7 @@ mod tests {
             pages: paginate(text, grid.cols, grid.lines_per_page),
             ..chapter(1, text, vec![hot("7-8", 2, 3, 42)])
         };
-        let l = build("b", "t", "a", &[c], grid);
+        let l = build("b", "t", "a", &[c], grid, false);
         assert!(l.taps.len() > 1, "expected the range to wrap");
         assert!(l.taps.iter().all(|t| t.range == "7-8" && t.count == 42));
         // Each line's box is tappable and resolves to the same range.
@@ -512,7 +526,7 @@ mod tests {
         let text: String = "一二三四五六七八九十".repeat(100);
         let hots: Vec<HotInput> = (0..151).map(|i| hot(&format!("r{i}"), i * 4, 2, 10)).collect();
         let c = ChapterInput { pages: paginate(&text, grid.cols, grid.lines_per_page), ..chapter(1, &text, hots) };
-        let l = build("b", "t", "a", &[c], grid);
+        let l = build("b", "t", "a", &[c], grid, false);
 
         assert_eq!(l.chapters[0].hot.len(), 151);
         let ranges: std::collections::BTreeSet<&str> = l.taps.iter().map(|t| t.range.as_str()).collect();
@@ -528,11 +542,11 @@ mod tests {
         let grid = Grid::default();
         let a = [chapter(1, "一二三", vec![])];
         let b = [chapter(1, "一二四", vec![])];
-        assert_ne!(content_hash(&a, &grid), content_hash(&b, &grid));
+        assert_ne!(content_hash(&a, &grid, false), content_hash(&b, &grid, false));
         let mut grid2 = grid;
         grid2.font_pt = 22.0;
-        assert_ne!(content_hash(&a, &grid), content_hash(&a, &grid2));
-        assert_eq!(content_hash(&a, &grid), content_hash(&a, &grid));
+        assert_ne!(content_hash(&a, &grid, false), content_hash(&a, &grid2, false));
+        assert_eq!(content_hash(&a, &grid, false), content_hash(&a, &grid, false));
     }
 
     #[test]
@@ -540,7 +554,7 @@ mod tests {
         let grid = Grid { cols: 6, lines_per_page: 2, ..Grid::default() };
         let text = "一二三四五";
         let c = ChapterInput { pages: paginate(text, 6, 2), ..chapter(1, text, vec![hot("1-2", 0, 2, 3)]) };
-        let l = build("b", "题", "作者", &[c], grid);
+        let l = build("b", "题", "作者", &[c], grid, false);
         let json = serde_json::to_string(&l).unwrap();
         let back: BookLayout = serde_json::from_str(&json).unwrap();
         assert_eq!(l, back);

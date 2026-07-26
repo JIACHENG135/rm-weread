@@ -43,8 +43,8 @@ fn main() {
         },
     ];
 
-    let layout = build("sample", "球状闪电（样例）", "刘慈欣", &chapters, grid);
-    let pdf = pdfgen::generate(&layout, &chapters).expect("generate");
+    let layout = build("sample", "球状闪电（样例）", "刘慈欣", &chapters, grid, false);
+    let pdf = pdfgen::generate(&layout, &chapters, None).expect("generate");
     std::fs::write("target/sample.pdf", &pdf).expect("write");
     println!(
         "target/sample.pdf: {} bytes, {} pages, {} underlines, {} tap targets",

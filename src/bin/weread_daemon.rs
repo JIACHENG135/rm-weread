@@ -83,28 +83,52 @@ fn gen_status(status: &str, message: &str) {
     write_result("gen.txt", status, &[message.to_string()]);
 }
 
-/// Scans for `ask_<chapterUid>_<range>_<nonce>` trigger files. The
-/// range id itself contains a '-', so split from the left on '_' and
-/// take the middle piece whole.
-fn take_asks() -> Vec<(i64, String)> {
+fn shelf_status(status: &str, message: &str) {
+    write_result("shelf.txt", status, &[message.to_string()]);
+}
+
+/// Scans for `ask_<bookId>_<chapterUid>_<range>_<nonce>` triggers.
+///
+/// The book id is in the filename because there is no "current book"
+/// any more — several generated books can be on the device, and the
+/// popup knows which one it is in from the open document's layout.
+/// The range id itself contains a '-', so split from the left on '_'
+/// and take the pieces whole.
+fn take_asks() -> Vec<(String, i64, String)> {
     let mut asks = Vec::new();
     let Ok(entries) = fs::read_dir(exthome()) else { return asks };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(rest) = name.strip_prefix("ask_") else { continue };
         let _ = fs::remove_file(entry.path());
-        let parts: Vec<&str> = rest.splitn(3, '_').collect();
-        if parts.len() < 2 {
+        let parts: Vec<&str> = rest.splitn(4, '_').collect();
+        if parts.len() < 3 {
             eprintln!("weread: malformed ask trigger: {name}");
             continue;
         }
-        let Ok(uid) = parts[0].parse::<i64>() else {
+        let Ok(uid) = parts[1].parse::<i64>() else {
             eprintln!("weread: malformed ask chapterUid: {name}");
             continue;
         };
-        asks.push((uid, parts[1].to_string()));
+        asks.push((parts[0].to_string(), uid, parts[2].to_string()));
     }
     asks
+}
+
+/// Scans for `gen_<bookId>_<nonce>` triggers from the shelf browser.
+fn take_gen_requests() -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(exthome()) else { return out };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix("gen_") else { continue };
+        let _ = fs::remove_file(entry.path());
+        match rest.split_once('_') {
+            Some((book_id, _)) if !book_id.is_empty() => out.push(book_id.to_string()),
+            _ => eprintln!("weread: malformed gen trigger: {name}"),
+        }
+    }
+    out
 }
 
 /// Retries an operation that hits the network. Flaky DNS on shared
@@ -131,13 +155,63 @@ fn with_retry<T>(
     Err(last.unwrap_or_else(|| "unknown error".into()))
 }
 
-fn generate_first_shelf_book(
+/// Publishes the shelf for the QML browser: `shelf.json` plus a cached
+/// cover thumbnail per book that QML loads straight off disk.
+///
+/// Cover downloads are best-effort and never fail the listing — a book
+/// with no artwork still has to be selectable.
+fn publish_shelf(
+    agent: &ureq::Agent,
+    sess: &login::Session,
+    paths: &Paths,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let shelf = shelf::sync(agent, &sess.api_key)?;
+    let reg = xochitl_doc::load_registry(&paths.registry());
+    let covers_dir = paths.exthome.join("covers");
+    let _ = fs::create_dir_all(&covers_dir);
+
+    let mut books = Vec::new();
+    for b in &shelf.books {
+        // The shelf URL is already a list-sized thumbnail, which is
+        // exactly what the browser wants; the large variant is fetched
+        // separately, into its own cache, only when a book is generated.
+        let dest = covers_dir.join(format!("{}.jpg", b.book_id));
+        let cover_rel = pipeline::fetch_cover(agent, &dest, &b.cover)
+            .map(|_| format!("covers/{}.jpg", b.book_id));
+        books.push(serde_json::json!({
+            "book_id": b.book_id,
+            "title": b.title,
+            "author": b.author,
+            "cover": cover_rel.unwrap_or_default(),
+            "finished": b.finish_reading != 0,
+            "generated": reg.books.contains_key(&b.book_id),
+        }));
+    }
+
+    let json = serde_json::to_string(&serde_json::json!({ "books": books }))?;
+    let tmp = paths.exthome.join("shelf.json.tmp");
+    fs::write(&tmp, json)?;
+    fs::rename(tmp, paths.exthome.join("shelf.json"))?;
+    Ok(books.len())
+}
+
+/// Generates one book by id. An empty id means "the first book on the
+/// shelf", which is what the bare `generate` trigger (and the install
+/// smoke test) still uses.
+fn generate_book_id(
     agent: &ureq::Agent,
     sess: &mut login::Session,
     paths: &Paths,
+    book_id: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let shelf = shelf::sync(agent, &sess.api_key)?;
-    let book = shelf.books.first().ok_or("书架是空的")?;
+    let book = if book_id.is_empty() {
+        shelf.books.first()
+    } else {
+        shelf.books.iter().find(|b| b.book_id == book_id)
+    }
+    .ok_or("书架上找不到这本书")?;
+
     println!("weread: generating {} / {}", book.title, book.author);
     let generated = pipeline::generate_book(
         agent,
@@ -146,6 +220,7 @@ fn generate_first_shelf_book(
         &book.book_id,
         &book.title,
         &book.author,
+        &book.cover,
         |note| gen_status("working", note),
     )?;
     let what = match &generated.delivery {
@@ -165,24 +240,13 @@ fn generate_first_shelf_book(
 fn answer_ask(
     agent: &ureq::Agent,
     sess: &login::Session,
-    paths: &Paths,
-    cache: &mut HashMap<(i64, String), underlines::RangeReviews>,
+    _paths: &Paths,
+    cache: &mut HashMap<(String, i64, String), underlines::RangeReviews>,
+    book_id: String,
     chapter_uid: i64,
     range: String,
 ) {
-    // book_id comes from the current layout.json — the popup and this
-    // daemon share the same "current book" slot (multi-book needs the
-    // current-document lookup; see docs/design.md's on-device TODO).
-    let book_id = fs::read_to_string(paths.exthome.join("layout.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.get("book_id").and_then(|b| b.as_str()).map(str::to_owned));
-    let Some(book_id) = book_id else {
-        write_result("reviews.txt", "error", &["还没有生成任何书".to_string()]);
-        return;
-    };
-
-    let key = (chapter_uid, range.clone());
+    let key = (book_id.clone(), chapter_uid, range.clone());
     let reviews = match cache.get(&key) {
         Some(r) => r.clone(),
         None => {
@@ -254,10 +318,11 @@ fn maybe_refresh(agent: &ureq::Agent, sess: &mut login::Session, paths: &Paths) 
 fn main() {
     let paths = Paths::device();
     fs::create_dir_all(&paths.exthome).expect("failed to create weread exthome dir");
-    for stale in ["generate", "open", "next", "prev", "close"] {
+    for stale in ["generate", "shelf", "open", "next", "prev", "close"] {
         let _ = fs::remove_file(exthome().join(stale));
     }
     let _ = take_asks();
+    let _ = take_gen_requests();
     if !exthome().join("gen.txt").exists() {
         gen_status("done", "(空闲)");
     }
@@ -280,18 +345,37 @@ fn main() {
         }
     };
 
-    let mut review_cache: HashMap<(i64, String), underlines::RangeReviews> = HashMap::new();
+    let mut review_cache: HashMap<(String, i64, String), underlines::RangeReviews> = HashMap::new();
     let mut last_refresh_check = 0u64;
 
     println!("weread_daemon: watching {} for triggers...", paths.exthome.display());
     loop {
+        if take_trigger("shelf") {
+            shelf_status("working", "正在读取书架…");
+            match with_retry("shelf", || publish_shelf(&agent, &sess, &paths)) {
+                Ok(n) => shelf_status("done", &format!("{n} 本")),
+                Err(e) => {
+                    eprintln!("weread: shelf sync failed: {e}");
+                    shelf_status("error", &format!("读取书架失败: {e}"));
+                }
+            }
+        }
+
+        // A bare `generate` still means "the first book on the shelf" —
+        // that's what the install smoke test pokes, with no UI involved.
+        let mut wanted: Vec<String> = take_gen_requests();
         if take_trigger("generate") {
+            wanted.push(String::new());
+        }
+        for book_id in wanted {
             gen_status("working", "正在生成…");
-            match with_retry("generate", || generate_first_shelf_book(&agent, &mut sess, &paths)) {
+            match with_retry("generate", || generate_book_id(&agent, &mut sess, &paths, &book_id)) {
                 Ok(message) => {
                     gen_status("done", &message);
                     review_cache.clear(); // ranges may have changed
                     let _ = session::save(Path::new(SESSION_PATH), &sess);
+                    // The browser shows a "已生成" badge; keep it honest.
+                    let _ = publish_shelf(&agent, &sess, &paths);
                 }
                 Err(e) => {
                     eprintln!("weread: generate failed: {e}");
@@ -300,8 +384,8 @@ fn main() {
             }
         }
 
-        for (chapter_uid, range) in take_asks() {
-            answer_ask(&agent, &sess, &paths, &mut review_cache, chapter_uid, range);
+        for (book_id, chapter_uid, range) in take_asks() {
+            answer_ask(&agent, &sess, &paths, &mut review_cache, book_id, chapter_uid, range);
         }
 
         // Cheap hourly check of the daily refresh clock.

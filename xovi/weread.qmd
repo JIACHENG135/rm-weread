@@ -18,11 +18,11 @@ IMPORT net.asivery.CommandExecutor 1.0
         // `xovi/debug` in the foreground before making it persistent.
         //
         // Two interactions:
-        //  1. Four-finger tap -> touch `generate`, show progress from
-        //     gen.txt while the daemon builds/refreshes the PDF.
+        //  1. Four-finger tap -> the shelf browser: pick any book and
+        //     the daemon generates it, with progress from gen.txt.
         //  2. Touch the underlined words themselves -> hit-test against
-        //     layout.json's `taps` boxes, touch
-        //     `ask_<chapterUid>_<range>_<nonce>`, poll reviews.txt,
+        //     layout/<docUuid>.json's `taps` boxes, touch
+        //     `ask_<bookId>_<chapterUid>_<range>_<nonce>`, poll reviews.txt,
         //     show the popup. Taps that miss every underline pass
         //     through untouched (mouse.accepted = false), so page turns
         //     behave exactly as before on the rest of the page.
@@ -37,12 +37,14 @@ IMPORT net.asivery.CommandExecutor 1.0
         //   view.page            0-based index of the page on screen
         //   view.pageBorderRect  that page's on-screen rect, in
         //                        touchArea's own coordinate space
-        //   view.document.id     xochitl uuid of the open document
+        //   view.document.id     xochitl uuid of the open document,
+        //                        which is also the key layouts are
+        //                        filed under (layout/<uuid>.json)
         // Using pageBorderRect instead of assuming "3:4 PDF fills the
         // 3:4 screen 1:1" means zoom and pan work for free — the rect
-        // already accounts for both. Gating on document.id against
-        // layout.json's doc_uuid means tap boxes can never fire in
-        // somebody else's document.
+        // already accounts for both. Because a layout is looked up *by*
+        // document.id, finding one is itself the proof that this PDF is
+        // ours — tap boxes can never fire in somebody else's document.
         // These names were found by walking the parent chain from here
         // and logging property names under `xovi/debug`; there is no
         // QML on disk to read (it lives in xochitl's qrc), so runtime
@@ -54,13 +56,7 @@ IMPORT net.asivery.CommandExecutor 1.0
             palmAreaThreshold: touchArea.tapPalmThreshold
             enabled: !touchArea.panAndZoomOnly
             fingers: 4
-            onClick: {
-                weReadStatus.lastSeq = weReadIpc.readSeq("gen.txt");
-                weReadStatus.message = "正在生成…";
-                weReadStatus.visible = true;
-                weReadCmd.executeCommand("/bin/touch", ["/home/root/xovi/exthome/weread/generate"]);
-                weReadGenPoller.start();
-            }
+            onClick: weReadShelf.open()
         }
 
         CommandExecutor {
@@ -75,12 +71,14 @@ IMPORT net.asivery.CommandExecutor 1.0
         Item {
             id: weReadIpc
             visible: false
+            // Layouts are stored per *document* uuid, so several books
+            // can be on the device at once. Each is a few hundred KB and
+            // JSON.parse blocks the UI thread, so parse at most once per
+            // document and remember which one is loaded — including the
+            // misses, so a tap in an unrelated PDF costs one file probe
+            // and never re-parses.
             property var layoutData: null
-            // layout.json is a few hundred KB and JSON.parse blocks the
-            // UI thread, so parse it lazily and at most once per run —
-            // without this a missing/unreadable file would re-parse on
-            // every single tap.
-            property bool layoutTried: false
+            property string layoutDocId: ""
 
             function readFile(name) {
                 var xhr = new XMLHttpRequest();
@@ -98,11 +96,20 @@ IMPORT net.asivery.CommandExecutor 1.0
                 return isNaN(n) ? 0 : n;
             }
 
-            function loadLayout() {
-                layoutTried = true;
-                var raw = readFile("layout.json");
-                if (!raw) { layoutData = null; return; }
-                try { layoutData = JSON.parse(raw); } catch (e) { layoutData = null; }
+            // Layout for whatever document is open, or null. Because
+            // the file is keyed by document uuid, finding one *is* the
+            // proof that this PDF is ours — no separate doc_uuid check.
+            function currentLayout() {
+                var id = openDocId();
+                if (!id) return null;
+                if (layoutDocId === id) return layoutData;
+                layoutDocId = id;
+                layoutData = null;
+                var raw = readFile("layout/" + id + ".json");
+                if (raw) {
+                    try { layoutData = JSON.parse(raw); } catch (e) { layoutData = null; }
+                }
+                return layoutData;
             }
 
             // xochitl uuid of the document currently open, "" if none.
@@ -116,11 +123,10 @@ IMPORT net.asivery.CommandExecutor 1.0
             }
 
             // 0-based page of the PDF currently on screen, or -1 when
-            // the open document isn't the book layout.json describes
-            // (so taps in every other document pass straight through).
+            // the open document is not one we generated (so taps in
+            // every other document pass straight through).
             function currentPage() {
-                if (!layoutData || !layoutData.doc_uuid) return -1;
-                if (openDocId() !== layoutData.doc_uuid) return -1;
+                if (!currentLayout()) return -1;
                 try {
                     var p = touchArea.view.page;
                     return (typeof p === "number" && p >= 0) ? p : -1;
@@ -176,7 +182,6 @@ IMPORT net.asivery.CommandExecutor 1.0
             propagateComposedEvents: true
             visible: !weReadPopup.visible
             onPressed: (mouse) => {
-                if (!weReadIpc.layoutData && !weReadIpc.layoutTried) weReadIpc.loadLayout();
                 var page = weReadIpc.currentPage();
                 if (page < 0) { mouse.accepted = false; return; }
                 var pt = weReadIpc.pagePoint(mouse.x, mouse.y);
@@ -192,7 +197,8 @@ IMPORT net.asivery.CommandExecutor 1.0
                 weReadPopup.visible = true;
                 weReadPopup.lastSeq = weReadIpc.readSeq("reviews.txt");
                 weReadCmd.executeCommand("/bin/touch", [
-                    "/home/root/xovi/exthome/weread/ask_" + t.chapter_uid + "_" + t.range + "_" + Date.now()
+                    "/home/root/xovi/exthome/weread/ask_" + weReadIpc.layoutData.book_id
+                        + "_" + t.chapter_uid + "_" + t.range + "_" + Date.now()
                 ]);
                 weReadReviewPoller.start();
             }
@@ -220,6 +226,297 @@ IMPORT net.asivery.CommandExecutor 1.0
             readonly property color rim: "#D8D8DC"
             readonly property int radius: 20
             readonly property int pad: 28
+        }
+
+
+        // ── Shelf browser ──────────────────────────────────────────
+        // Four-finger tap opens this anywhere in xochitl. It lists the
+        // WeRead shelf the daemon published to shelf.json (covers cached
+        // beside it as plain files, which is the only way QML can show
+        // them — no network from inside xochitl's process), and tapping
+        // a book asks the daemon to generate it.
+        Item {
+            id: weReadShelf
+            visible: false
+            z: 1600
+            width: Math.min(parent.width * 0.86, 1000)
+            height: Math.min(parent.height * 0.78, 1500)
+            anchors.centerIn: parent
+
+            property int lastSeq: 0
+            property var books: []
+            property string mode: "loading"
+            property string errorText: ""
+
+            function open() {
+                errorText = "";
+                load();
+                mode = books.length > 0 ? "ok" : "loading";
+                visible = true;
+                // Always ask for a fresh shelf, but show the cached one
+                // meanwhile so the browser never opens empty.
+                lastSeq = weReadIpc.readSeq("shelf.txt");
+                weReadCmd.executeCommand("/bin/touch", ["/home/root/xovi/exthome/weread/shelf"]);
+                weReadShelfPoller.start();
+            }
+
+            function load() {
+                var raw = weReadIpc.readFile("shelf.json");
+                if (!raw) return;
+                try {
+                    var v = JSON.parse(raw);
+                    books = v.books || [];
+                } catch (e) {
+                    books = [];
+                }
+            }
+
+            function generate(book) {
+                visible = false;
+                weReadShelfPoller.stop();
+                weReadStatus.lastSeq = weReadIpc.readSeq("gen.txt");
+                weReadStatus.message = "正在生成《" + book.title + "》…";
+                weReadStatus.visible = true;
+                weReadCmd.executeCommand("/bin/touch", [
+                    "/home/root/xovi/exthome/weread/gen_" + book.book_id + "_" + Date.now()
+                ]);
+                weReadGenPoller.start();
+            }
+
+            Rectangle {
+                anchors.fill: parent
+                anchors.topMargin: 4
+                anchors.bottomMargin: -4
+                radius: weReadStyle.radius + 2
+                color: weReadStyle.rim
+            }
+
+            Rectangle {
+                anchors.fill: parent
+                radius: weReadStyle.radius
+                color: weReadStyle.surface
+                border.color: weReadStyle.edge
+                border.width: 1
+                clip: true
+
+                Column {
+                    id: weReadShelfHeader
+                    anchors.top: parent.top
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.margins: weReadStyle.pad
+                    spacing: 8
+
+                    Text {
+                        font.family: weReadFont.name
+                        font.pixelSize: 30
+                        color: weReadStyle.ink
+                        text: "微信读书"
+                    }
+                    Text {
+                        font.family: weReadFont.name
+                        font.pixelSize: 20
+                        color: weReadStyle.inkMuted
+                        text: weReadShelf.mode === "ok"
+                            ? "选一本生成到设备"
+                            : weReadShelf.mode === "error" ? weReadShelf.errorText : "正在读取书架…"
+                    }
+                }
+
+                Rectangle {
+                    id: weReadShelfRule
+                    anchors.top: weReadShelfHeader.bottom
+                    anchors.topMargin: weReadStyle.pad - 8
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    height: 1
+                    color: weReadStyle.hairline
+                }
+
+                Flickable {
+                    id: weReadShelfFlick
+                    anchors.top: weReadShelfRule.bottom
+                    anchors.bottom: parent.bottom
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    contentHeight: weReadShelfList.height
+                    clip: true
+                    boundsBehavior: Flickable.StopAtBounds
+
+                    Column {
+                        id: weReadShelfList
+                        width: weReadShelfFlick.width
+
+                        Repeater {
+                            model: weReadShelf.books
+
+                            delegate: Item {
+                                width: weReadShelfList.width
+                                height: 200
+
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: weReadShelf.generate(modelData)
+                                }
+
+                                Rectangle {
+                                    id: weReadShelfCover
+                                    x: weReadStyle.pad
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    width: 116
+                                    height: 166
+                                    color: weReadStyle.fill
+                                    border.color: weReadStyle.hairline
+                                    border.width: 1
+
+                                    Image {
+                                        anchors.fill: parent
+                                        anchors.margins: 1
+                                        fillMode: Image.PreserveAspectCrop
+                                        asynchronous: true
+                                        cache: false
+                                        visible: modelData.cover !== ""
+                                        source: modelData.cover
+                                            ? "file:///home/root/xovi/exthome/weread/" + modelData.cover
+                                            : ""
+                                    }
+                                }
+
+                                Column {
+                                    anchors.left: weReadShelfCover.right
+                                    anchors.leftMargin: 22
+                                    anchors.right: parent.right
+                                    anchors.rightMargin: weReadStyle.pad
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    spacing: 10
+
+                                    Text {
+                                        width: parent.width
+                                        wrapMode: Text.Wrap
+                                        maximumLineCount: 2
+                                        elide: Text.ElideRight
+                                        font.family: weReadFont.name
+                                        font.pixelSize: 27
+                                        color: weReadStyle.ink
+                                        text: modelData.title
+                                    }
+                                    Text {
+                                        width: parent.width
+                                        elide: Text.ElideRight
+                                        font.family: weReadFont.name
+                                        font.pixelSize: 21
+                                        color: weReadStyle.inkMuted
+                                        text: modelData.author
+                                    }
+                                    Rectangle {
+                                        width: weReadShelfBadge.implicitWidth + 22
+                                        height: weReadShelfBadge.implicitHeight + 12
+                                        radius: height / 2
+                                        color: weReadStyle.fill
+                                        border.color: weReadStyle.hairline
+                                        border.width: 1
+                                        visible: modelData.generated
+
+                                        Text {
+                                            id: weReadShelfBadge
+                                            anchors.centerIn: parent
+                                            font.family: weReadFont.name
+                                            font.pixelSize: 18
+                                            color: weReadStyle.inkMuted
+                                            text: "已在设备上 · 点按刷新"
+                                        }
+                                    }
+                                }
+
+                                Rectangle {
+                                    anchors.bottom: parent.bottom
+                                    anchors.left: parent.left
+                                    anchors.leftMargin: weReadStyle.pad
+                                    anchors.right: parent.right
+                                    height: 1
+                                    color: weReadStyle.hairline
+                                    visible: index < weReadShelf.books.length - 1
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    anchors.top: weReadShelfRule.bottom
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    anchors.margins: weReadStyle.pad
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                    wrapMode: Text.Wrap
+                    font.family: weReadFont.name
+                    font.pixelSize: 23
+                    color: weReadStyle.inkMuted
+                    visible: weReadShelf.books.length === 0
+                    text: weReadShelf.mode === "error" ? weReadShelf.errorText : "正在读取书架…"
+                }
+
+                Rectangle {
+                    width: 4
+                    radius: 2
+                    color: weReadStyle.edge
+                    anchors.right: parent.right
+                    anchors.rightMargin: 8
+                    visible: weReadShelfFlick.contentHeight > weReadShelfFlick.height
+                    height: Math.max(48, weReadShelfFlick.height * weReadShelfFlick.height
+                        / Math.max(1, weReadShelfFlick.contentHeight))
+                    y: weReadShelfFlick.y + weReadShelfFlick.contentY
+                       * (weReadShelfFlick.height - height)
+                       / Math.max(1, weReadShelfFlick.contentHeight - weReadShelfFlick.height)
+                }
+            }
+        }
+
+        MouseArea {
+            id: weReadShelfDismiss
+            anchors.fill: parent
+            z: 1550
+            visible: weReadShelf.visible
+            onClicked: {
+                weReadShelf.visible = false;
+                weReadShelfPoller.stop();
+            }
+        }
+
+        Timer {
+            id: weReadShelfPoller
+            interval: 400
+            repeat: true
+            property int elapsedMs: 0
+            onTriggered: {
+                elapsedMs += interval;
+                var lines = weReadIpc.readFile("shelf.txt").split("\n");
+                var seq = parseInt(lines[0]);
+                if (!isNaN(seq) && seq > weReadShelf.lastSeq) {
+                    weReadShelf.lastSeq = seq;
+                    var status = lines.length > 1 ? lines[1] : "";
+                    if (status === "working") { elapsedMs = 0; return; }
+                    if (status === "ok" || status === "done") {
+                        weReadShelf.load();
+                        weReadShelf.mode = "ok";
+                    } else {
+                        weReadShelf.errorText = lines.length > 2 ? lines.slice(2).join(" ") : "读取书架失败";
+                        weReadShelf.mode = "error";
+                    }
+                    elapsedMs = 0;
+                    stop();
+                    return;
+                }
+                // Covers download on first sync, so allow a while.
+                if (elapsedMs > 120000) {
+                    weReadShelf.errorText = "读取书架超时";
+                    weReadShelf.mode = "error";
+                    elapsedMs = 0;
+                    stop();
+                }
+            }
         }
 
         Item {
@@ -283,7 +580,11 @@ IMPORT net.asivery.CommandExecutor 1.0
                     var status = lines.length > 1 ? lines[1] : "";
                     weReadStatus.message = lines.length > 2 ? lines.slice(2).join(" ") : "";
                     if (status === "working") { elapsedMs = 0; return; }
-                    weReadIpc.loadLayout();
+                    // A fresh generation may have rewritten the layout
+                    // for the document that's open; drop the cache so
+                    // the next tap re-reads it.
+                    weReadIpc.layoutDocId = "";
+                    weReadIpc.layoutData = null;
                     elapsedMs = 0;
                     stop();
                     weReadStatusHide.restart();

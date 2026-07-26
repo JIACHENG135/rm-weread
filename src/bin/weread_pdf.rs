@@ -33,12 +33,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         exthome: out_dir.join("exthome"),
     };
 
-    let (book_id, title, author) = match arg("--book-id") {
-        Some(id) => (id, "未知书名".to_string(), String::new()),
+    let (book_id, title, author, cover) = match arg("--book-id") {
+        Some(id) => (id, "未知书名".to_string(), String::new(), String::new()),
         None => {
             let shelf = shelf::sync(&agent, &sess.api_key)?;
             let book = shelf.books.first().ok_or("shelf is empty")?;
-            (book.book_id.clone(), book.title.clone(), book.author.clone())
+            (book.book_id.clone(), book.title.clone(), book.author.clone(), book.cover.clone())
         }
     };
     println!("book: {title} / {author} ({book_id})");
@@ -54,13 +54,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let generated = pipeline::generate_book(&agent, &mut sess, &paths, &book_id, &title, &author, |note| {
-        println!("  {note}");
-    })?;
+    let generated =
+        pipeline::generate_book(&agent, &mut sess, &paths, &book_id, &title, &author, &cover, |note| {
+            println!("  {note}");
+        })?;
     session::save(&path, &sess)?;
 
     println!(
-        "delivered: {:?}\npages: {}, underlines: {}, tap targets: {}\nPDF + metadata in {}\nlayout.json in {}",
+        "delivered: {:?}\npages: {}, underlines: {}, tap targets: {}\nPDF + metadata in {}\nlayout/<uuid>.json in {}",
         generated.delivery,
         generated.layout.page_count,
         generated.layout.hot_count(),

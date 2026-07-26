@@ -44,6 +44,72 @@ impl Paths {
     pub fn layout_file(&self, book_id: &str) -> PathBuf {
         self.data_dir.join("layout").join(format!("{book_id}.json"))
     }
+    /// Cover artwork, cached so a decoration refresh rebuilds the exact
+    /// same page 0 without the network.
+    pub fn cover_file(&self, book_id: &str) -> PathBuf {
+        self.data_dir.join("covers").join(format!("{book_id}.jpg"))
+    }
+}
+
+/// Downloads an image once and caches it at `cached`. Failure is not
+/// fatal: a book without artwork still gets a typeset title page, and
+/// `has_cover` stays true either way so the page numbering can't wobble
+/// with network conditions.
+///
+/// The destination is a parameter rather than derived from the book id
+/// because the same book has two covers at two sizes — the shelf
+/// thumbnail the browser lists, and the largest variant the PDF embeds.
+/// Sharing one cache slot would silently pin whichever was fetched
+/// first, and in practice that is the small one.
+pub fn fetch_cover(agent: &ureq::Agent, cached: &std::path::Path, url: &str) -> Option<Vec<u8>> {
+    if let Ok(bytes) = fs::read(cached) {
+        return Some(bytes);
+    }
+    if url.is_empty() {
+        return None;
+    }
+    let bytes = (|| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut resp = agent.get(url).call()?;
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut resp.body_mut().as_reader(), &mut buf)?;
+        Ok(buf)
+    })();
+    match bytes {
+        Ok(b) if !b.is_empty() => {
+            if let Some(parent) = cached.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::write(cached, &b);
+            Some(b)
+        }
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("weread: cover download failed ({url}): {e}; using a text-only cover");
+            None
+        }
+    }
+}
+
+/// WeRead serves covers in numbered size variants (`t6_`, `t7_`…), and
+/// the shelf hands back a small one. `t9_` is the largest that exists —
+/// still only ~428×616, which is why the cover page composes the art
+/// rather than bleeding it to the edges.
+pub fn largest_cover_url(url: &str) -> String {
+    match url.rfind('/') {
+        Some(slash) => {
+            let (dir, file) = url.split_at(slash + 1);
+            let bumped = match file.split_once('_') {
+                Some((prefix, rest))
+                    if prefix.starts_with('t') && prefix[1..].chars().all(|c| c.is_ascii_digit()) =>
+                {
+                    format!("t9_{rest}")
+                }
+                _ => file.to_string(),
+            };
+            format!("{dir}{bumped}")
+        }
+        None => url.to_string(),
+    }
 }
 
 /// Fetches one chapter's XHTML, through the on-disk cache. The cache
@@ -70,18 +136,46 @@ fn chapter_xhtml(
     Ok(text)
 }
 
+/// Underlines for one chapter, falling back to whatever the previous
+/// build recorded when the call fails.
+///
+/// Without the fallback, throttling quietly *deletes* decoration: a real
+/// regeneration hit 45 HTTP 499s and came back with 655 of the book's
+/// 840 underlines, which then swapped in place over the good version.
+/// Underlines are still optional — a chapter that has never been fetched
+/// successfully just has none — but a failed call must never be allowed
+/// to look like "this chapter has fewer underlines now".
 fn fetch_hot(
     agent: &ureq::Agent,
     api_key: &str,
     book_id: &str,
     chapter_uid: i64,
     text: &xhtml::Text,
+    previous: Option<&[layout::Hot]>,
 ) -> Vec<layout::HotInput> {
     match underlines::fetch_underlines(agent, api_key, book_id, chapter_uid) {
         Ok(u) => underlines::map_to_text(&u, text),
         Err(e) => {
-            eprintln!("weread: underlines for chapter {chapter_uid} failed ({e}); continuing without");
-            Vec::new()
+            let kept: Vec<layout::HotInput> = previous
+                .unwrap_or_default()
+                .iter()
+                .map(|h| layout::HotInput {
+                    range: h.range.clone(),
+                    off: h.off,
+                    len: h.len,
+                    count: h.count,
+                })
+                .collect();
+            if kept.is_empty() {
+                eprintln!("weread: underlines for chapter {chapter_uid} failed ({e}); continuing without");
+            } else {
+                eprintln!(
+                    "weread: underlines for chapter {chapter_uid} failed ({e}); \
+                     keeping the {} already known rather than dropping them",
+                    kept.len()
+                );
+            }
+            kept
         }
     }
 }
@@ -98,12 +192,25 @@ fn build_chapters(
     grid: &Grid,
     mut progress: impl FnMut(&str),
 ) -> Result<Vec<ChapterInput>, Box<dyn std::error::Error>> {
+    // What the last successful build knew, so a throttled call this time
+    // degrades to "unchanged" instead of "gone".
+    let known: std::collections::HashMap<i64, Vec<layout::Hot>> = load_layout(paths, book_id)
+        .map(|l| l.chapters.into_iter().map(|c| (c.chapter_uid, c.hot)).collect())
+        .unwrap_or_default();
+
     let mut inputs = Vec::new();
     for (i, ch) in chapters.iter().enumerate() {
         progress(&format!("章节 {}/{}: {}", i + 1, chapters.len(), ch.title));
         let xhtml_raw = chapter_xhtml(agent, sess, paths, book_id, ch)?;
         let text = xhtml::to_text(&xhtml_raw);
-        let hot = fetch_hot(agent, &sess.api_key, book_id, ch.chapter_uid, &text);
+        let hot = fetch_hot(
+            agent,
+            &sess.api_key,
+            book_id,
+            ch.chapter_uid,
+            &text,
+            known.get(&ch.chapter_uid).map(Vec::as_slice),
+        );
         let pages = paginate::paginate(&text.text, grid.cols, grid.lines_per_page);
         inputs.push(ChapterInput {
             chapter_uid: ch.chapter_uid,
@@ -130,6 +237,7 @@ pub fn generate_book(
     book_id: &str,
     title: &str,
     author: &str,
+    cover_url: &str,
     progress: impl FnMut(&str),
 ) -> Result<Generated, Box<dyn std::error::Error>> {
     reader::renew_session(agent, &mut sess.cookies)?;
@@ -138,12 +246,15 @@ pub fn generate_book(
         return Err("没有可读章节".into());
     }
     let grid = Grid::default();
+    let cover = fetch_cover(agent, &paths.cover_file(book_id), &largest_cover_url(cover_url));
     let inputs = build_chapters(agent, sess, paths, book_id, &chapters, &grid, progress)?;
-    finish_build(paths, book_id, title, author, inputs, grid)
+    // A title page is always page 0, artwork or not — see fetch_cover.
+    finish_build(paths, book_id, title, author, inputs, grid, true, cover)
 }
 
 /// The offline tail of the pipeline — split out so a decoration
 /// refresh (which re-reads cached text) shares it.
+#[allow(clippy::too_many_arguments)]
 fn finish_build(
     paths: &Paths,
     book_id: &str,
@@ -151,9 +262,11 @@ fn finish_build(
     author: &str,
     inputs: Vec<ChapterInput>,
     grid: Grid,
+    has_cover: bool,
+    cover: Option<Vec<u8>>,
 ) -> Result<Generated, Box<dyn std::error::Error>> {
-    let mut book_layout = layout::build(book_id, title, author, &inputs, grid);
-    let pdf = pdfgen::generate(&book_layout, &inputs)?;
+    let mut book_layout = layout::build(book_id, title, author, &inputs, grid, has_cover);
+    let pdf = pdfgen::generate(&book_layout, &inputs, cover.as_deref())?;
     let delivery = xochitl_doc::deliver(&paths.xochitl_dir, &paths.registry(), &book_layout, &pdf)?;
     book_layout.doc_uuid = match &delivery {
         Delivery::Created { uuid } | Delivery::Refreshed { uuid } | Delivery::Replaced { uuid } => uuid.clone(),
@@ -169,13 +282,17 @@ fn write_layout(paths: &Paths, l: &BookLayout) -> std::io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::write(&per_book, &json)?;
-    // The exthome copy is what the QML popup XHRs; single "current
-    // book" slot for now (multi-book needs the current-document-uuid
-    // lookup recorded as an on-device TODO in docs/design.md).
-    fs::create_dir_all(&paths.exthome)?;
-    let tmp = paths.exthome.join("layout.json.tmp");
+
+    // The QML copy is keyed by *document* uuid, not book id: the popup
+    // knows which document is open (`view.document.id`) and nothing
+    // else, so this is the one name it can look up directly. Keying it
+    // this way is also what lets several generated books coexist —
+    // there is no "current book" slot any more.
+    let dir = paths.exthome.join("layout");
+    fs::create_dir_all(&dir)?;
+    let tmp = dir.join(format!("{}.json.tmp", l.doc_uuid));
     fs::write(&tmp, &json)?;
-    fs::rename(tmp, paths.exthome.join("layout.json"))
+    fs::rename(tmp, dir.join(format!("{}.json", l.doc_uuid)))
 }
 
 pub fn load_layout(paths: &Paths, book_id: &str) -> Option<BookLayout> {
@@ -252,7 +369,12 @@ pub fn refresh_decorations(
             hot: mapped,
         });
     }
-    let generated = finish_build(paths, book_id, &old.title, &old.author, inputs, old.grid)?;
+    // Cache only: re-downloading here could hand us different bytes, and
+    // a *missing* cover would silently drop page 0 and shift the whole
+    // book under the reader's ink.
+    let cover = fs::read(paths.cover_file(book_id)).ok();
+    let generated =
+        finish_build(paths, book_id, &old.title, &old.author, inputs, old.grid, old.cover, cover)?;
     // A decoration refresh must never have changed geometry.
     if generated.layout.content_sha256 != old.content_sha256 {
         eprintln!(
@@ -266,6 +388,25 @@ pub fn refresh_decorations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cover_urls_are_bumped_to_the_largest_variant() {
+        // t9_ is the biggest WeRead serves; t10_ and up 404.
+        assert_eq!(
+            largest_cover_url("https://cdn.weread.qq.com/weread/cover/88/X_1/t6_X_1.jpg"),
+            "https://cdn.weread.qq.com/weread/cover/88/X_1/t9_X_1.jpg"
+        );
+        // Already largest: unchanged.
+        assert_eq!(
+            largest_cover_url("https://c/x/t9_a.jpg"),
+            "https://c/x/t9_a.jpg"
+        );
+        // Not a size-prefixed name (audiobook covers, the articles
+        // pseudo-entry): left exactly alone rather than guessed at.
+        assert_eq!(largest_cover_url("https://c/x/s_abc.png"), "https://c/x/s_abc.png");
+        assert_eq!(largest_cover_url("https://c/x/plain.jpg"), "https://c/x/plain.jpg");
+        assert_eq!(largest_cover_url(""), "");
+    }
     use crate::layout::{Grid, HotInput, build};
     use crate::paginate::paginate;
 
@@ -288,7 +429,7 @@ mod tests {
                 }
             })
             .collect();
-        build("b", "t", "a", &chapters, grid)
+        build("b", "t", "a", &chapters, grid, false)
     }
 
     #[test]
