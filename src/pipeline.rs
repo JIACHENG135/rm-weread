@@ -320,7 +320,7 @@ pub fn hot_for_chapter(
     book_id: &str,
     chapter_uid: i64,
 ) -> Result<Vec<layout::Tap>, Box<dyn std::error::Error>> {
-    let book = load_layout(paths, book_id).ok_or("no layout for this book — generate it first")?;
+    let book = read_layout(paths, book_id)?;
     let chapter = book
         .chapters
         .iter()
@@ -339,8 +339,27 @@ pub fn hot_for_chapter(
 }
 
 pub fn load_layout(paths: &Paths, book_id: &str) -> Option<BookLayout> {
-    let s = fs::read_to_string(paths.layout_file(book_id)).ok()?;
-    serde_json::from_str(&s).ok()
+    read_layout(paths, book_id).ok()
+}
+
+/// Same, but says *why* it failed.
+///
+/// The silent `.ok()` version cost real debugging time: a layout written
+/// by an older build stopped deserializing when `Grid.cols` became
+/// `Grid.text_em`, and every caller reported it as "no layout for this
+/// book — generate it first". The file was right there. A stale schema
+/// and a missing file need different answers from the reader, so they
+/// need different messages.
+pub fn read_layout(paths: &Paths, book_id: &str) -> Result<BookLayout, String> {
+    let path = paths.layout_file(book_id);
+    let raw = fs::read_to_string(&path)
+        .map_err(|e| format!("no layout at {} ({e}) — generate this book first", path.display()))?;
+    serde_json::from_str(&raw).map_err(|e| {
+        format!(
+            "layout at {} was written by an incompatible build ({e}) — regenerate this book",
+            path.display()
+        )
+    })
 }
 
 #[cfg(test)]

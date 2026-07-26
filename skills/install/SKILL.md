@@ -247,6 +247,54 @@ appear, which the card offers as a button.
 Touch the underlined words in a generated book to see other readers'
 comments.
 
+## A second device
+
+reMarkable's **own cloud sync** replicates the 微信读书 folder between a
+reader's tablets, uuids intact. That is mostly a gift — the books appear
+on the second device without generating anything — but sync carries
+*documents only*. Everything this project keeps beside them does not
+travel:
+
+| Travels via reMarkable sync | Does not |
+|---|---|
+| the PDFs, the folder, the ＋ 书架 card | `layout/<docUuid>.json` (QML hit-testing) |
+| | `~/.local/share/rm-weread/layout/<bookId>.json` |
+| | `~/.local/share/rm-weread/chapters/` (needed to compute underline boxes) |
+| | `docs.json` |
+
+A second device therefore shows the books but cannot draw underlines or
+open reviews on them: with no layout there are no tap targets at all.
+The daemon adopts synced documents by title so it will not duplicate
+them, but it cannot invent their geometry.
+
+Two ways to fix it, both fine:
+
+```sh
+# Copy the sidecar across — uuids match, so the files apply verbatim.
+ssh root@<from> 'cd /home/root/.local/share/rm-weread && tar cz chapters layout docs.json'   | ssh root@<to> 'cd /home/root/.local/share/rm-weread && tar xz'
+ssh root@<from> 'cd /home/root/xovi/exthome/weread && tar cz layout'   | ssh root@<to> 'cd /home/root/xovi/exthome/weread && tar xz'
+```
+
+or just regenerate each book on the second device — with the chapter
+cache absent it re-downloads the text, but it still makes zero underline
+requests.
+
+Stop the daemon on the receiving side while copying, and restart it
+after.
+
+**A copied layout must come from the same build.** If the schema moved
+(`LAYOUT_ALGO_VERSION`, or a `Grid` field), the daemon will say so
+plainly — `written by an incompatible build … regenerate this book` —
+and regenerating is the answer. Regeneration reuses the chapter cache,
+so it is fast and costs no underline requests.
+
+## Deleting, with two devices
+
+Deletion is `parent: "trash"`, held in memory and flushed later. With
+two tablets, a copy that is still live elsewhere can sync *back* and
+reappear under a new uuid. Delete on both, or delete once and let sync
+settle before checking.
+
 ## IPC
 
 QML can only run `/bin/touch`, so parameters live in filenames. All
