@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>rm-weread — 在 reMarkable 上读英文原版，圈词即译，按遗忘曲线复习</title>
+<meta name="description" content="把微信读书搬进 reMarkable：中英对照原版书，圈出生词立刻看到释义和例句，查过的词按遗忘曲线回来找你。还有几千位读者的划线与想法陪你共读。">
+<meta property="og:title" content="rm-weread — 在 reMarkable 上读英文原版书">
+<meta property="og:description" content="圈词即译，不打断心流；按遗忘曲线复习，帮你留住每个生词。">
+<style>
+:root{
+  --paper:#F4F3EE; --paper-deep:#EBEAE3;
+  --ink:#201F1B; --ink-soft:#4A4943; --gray:#807F77;
+  --line:#D7D6CD; --blue:#2E63C9; --blue-wash:#E3EBFA;
+  --serif:"Songti SC","Noto Serif SC","Noto Serif CJK SC","Source Han Serif SC","SimSun",Georgia,serif;
+  --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,"Liberation Mono",monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+body{background:var(--paper);color:var(--ink);font-family:var(--serif);font-size:17px;line-height:2;-webkit-font-smoothing:antialiased}
+::selection{background:var(--blue-wash)}
+a{color:inherit}
+img,video{display:block;max-width:100%}
+.mono{font-family:var(--mono)}
+
+/* ---------- bar ---------- */
+.bar{position:sticky;top:0;z-index:50;background:color-mix(in srgb,var(--paper) 92%,transparent);backdrop-filter:blur(6px);border-bottom:1px solid var(--line)}
+.bar-in{max-width:1160px;margin:0 auto;padding:14px 24px;display:flex;align-items:baseline;gap:24px}
+.logo{font-family:var(--mono);font-size:15px;font-weight:700;text-decoration:none}
+.logo b{color:var(--blue)}
+.bar nav{margin-left:auto;display:flex;gap:22px}
+.bar nav a{font-family:var(--mono);font-size:12.5px;color:var(--ink-soft);text-decoration:none;letter-spacing:.04em}
+.bar nav a:hover{color:var(--blue)}
+
+/* ---------- hero ---------- */
+.hero{max-width:1160px;margin:0 auto;padding:76px 24px 60px;display:grid;grid-template-columns:minmax(0,1.02fr) minmax(0,.98fr);gap:60px;align-items:center}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.14em;color:var(--gray);display:flex;align-items:center;gap:10px;margin-bottom:22px}
+.eyebrow::before{content:"";width:26px;height:1px;background:var(--gray)}
+h1{font-size:clamp(33px,4.5vw,50px);line-height:1.34;font-weight:900;margin-bottom:24px}
+h1 .nat{border-bottom:3px solid var(--blue);padding-bottom:2px}
+.lede{font-size:18px;color:var(--ink-soft);max-width:32em;margin-bottom:34px}
+.ctas{display:flex;flex-wrap:wrap;gap:14px;align-items:center}
+.btn{display:inline-block;font-family:var(--mono);font-size:14px;letter-spacing:.03em;padding:13px 26px;text-decoration:none;border:1.5px solid var(--ink);transition:transform .12s ease,box-shadow .12s ease}
+.btn-primary{background:var(--ink);color:var(--paper)}
+.btn-primary:hover{transform:translate(-2px,-2px);box-shadow:4px 4px 0 var(--blue)}
+.btn-ghost{color:var(--ink)}
+.btn-ghost:hover{transform:translate(-2px,-2px);box-shadow:4px 4px 0 var(--line)}
+.btn:focus-visible,.hl:focus-visible,a:focus-visible,video:focus-visible{outline:2px solid var(--blue);outline-offset:3px}
+.hero-note{font-family:var(--mono);font-size:12px;color:var(--gray);margin-top:18px}
+
+/* ---------- device frame ---------- */
+.device{width:min(372px,100%);background:#E4E3DC;border:1px solid #C2C1B7;border-radius:16px;padding:13px 11px 32px;position:relative;box-shadow:0 30px 60px -30px rgba(32,31,27,.45),inset 0 0 0 1px #F2F1EB}
+.device::after{content:"";position:absolute;left:50%;bottom:11px;transform:translateX(-50%);width:34px;height:4px;border-radius:3px;background:#C9C8BF}
+.device video,.device img{border-radius:2px;border:1px solid #CFCEC5;width:100%;background:#FBFAF7}
+.device-wrap{display:flex;flex-direction:column;align-items:center;gap:14px}
+.shot-note{font-family:var(--mono);font-size:11px;letter-spacing:.1em;color:var(--gray);text-align:center;line-height:1.7}
+.shot-note::before{content:"● ";color:var(--blue);font-size:9px;vertical-align:middle}
+
+/* ---------- strip ---------- */
+.strip{border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:var(--paper-deep)}
+.strip-in{max-width:1160px;margin:0 auto;padding:16px 24px;display:flex;flex-wrap:wrap;gap:12px 0;justify-content:space-between;font-family:var(--mono);font-size:12.5px;color:var(--ink-soft)}
+.strip-in span{padding:0 18px;border-left:1px solid var(--line)}
+.strip-in span:first-child{border-left:none;padding-left:0}
+
+/* ---------- chapters ---------- */
+.chapter{max-width:760px;margin:0 auto;padding:92px 24px 0}
+.chapter.wide{max-width:1160px}
+.ch-mark{display:flex;align-items:center;gap:16px;margin-bottom:30px}
+.ch-mark .num{font-size:15px;font-weight:900;border:1.5px solid var(--ink);width:38px;height:38px;display:flex;align-items:center;justify-content:center;border-radius:50%}
+.ch-mark .label{font-family:var(--mono);font-size:12px;letter-spacing:.16em;color:var(--gray)}
+h2{font-size:clamp(24px,3vw,32px);font-weight:900;line-height:1.5;margin-bottom:26px}
+.chapter p{color:var(--ink-soft);margin-bottom:20px;max-width:42em}
+.chapter p strong{color:var(--ink);font-weight:900}
+
+/* ---------- figures ---------- */
+figure{margin:0}
+.fig video,.fig img{border:1px solid var(--line);border-radius:4px;box-shadow:0 18px 40px -26px rgba(32,31,27,.5);background:#FBFAF7;width:100%}
+.fig figcaption{font-family:var(--mono);font-size:11.5px;line-height:1.85;color:var(--gray);margin-top:12px;display:flex;gap:8px;align-items:flex-start}
+.fig figcaption b{color:var(--blue);font-weight:400;white-space:nowrap}
+.fig-two{display:grid;grid-template-columns:1fr 1fr;gap:32px;margin-top:44px;align-items:start}
+
+/* ---------- steps ---------- */
+.steps{counter-reset:step;margin:36px 0 8px;border-top:1px solid var(--line)}
+.step{display:grid;grid-template-columns:64px 1fr;gap:20px;align-items:baseline;padding:24px 4px;border-bottom:1px solid var(--line)}
+.step::before{counter-increment:step;content:counter(step,cjk-ideographic);font-size:22px;font-weight:900;color:var(--blue)}
+.step h3{font-size:18px;font-weight:900;margin-bottom:6px}
+.step p{font-size:15px;line-height:1.9;color:var(--ink-soft);margin:0}
+
+/* ---------- underline signature ---------- */
+.hl{font:inherit;color:inherit;background:none;border:none;cursor:pointer;border-bottom:1.5px dashed var(--blue);padding-bottom:1px;position:relative;background:linear-gradient(transparent 84%,rgba(46,99,201,.14) 84%)}
+.hl-pop{position:absolute;left:50%;bottom:calc(100% + 12px);transform:translateX(-50%);width:min(300px,76vw);background:#FFF;border:1px solid var(--line);border-radius:8px;padding:13px 16px;text-align:left;box-shadow:0 14px 30px -14px rgba(32,31,27,.45);opacity:0;visibility:hidden;transition:opacity .15s ease;z-index:30;font-weight:400}
+.hl-pop::after{content:"";position:absolute;top:100%;left:50%;transform:translateX(-50%);border:7px solid transparent;border-top-color:#FFF}
+.hl-pop .who{font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;color:var(--blue);display:block;margin-bottom:5px}
+.hl-pop .say{font-size:13px;line-height:1.75;color:var(--ink-soft);display:block}
+.hl:hover .hl-pop,.hl:focus .hl-pop,.hl.open .hl-pop{opacity:1;visibility:visible}
+.hl-hint{font-family:var(--mono);font-size:12px;color:var(--gray);margin-top:-6px}
+.hl-hint::before{content:"※ ";color:var(--blue)}
+
+/* ---------- aside ---------- */
+.aside{border-left:3px solid var(--blue);background:var(--paper-deep);padding:22px 26px;margin:30px 0}
+.aside .tag{font-family:var(--mono);font-size:11px;letter-spacing:.14em;color:var(--blue);display:block;margin-bottom:10px}
+.aside p{font-size:15.5px;margin-bottom:12px}
+.aside p:last-child{margin-bottom:0}
+
+/* ---------- feature blocks ---------- */
+.feat{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:56px;align-items:center;margin-top:52px}
+.feat + .feat{margin-top:96px}
+.feat h3{font-size:clamp(20px,2.4vw,26px);font-weight:900;line-height:1.55;margin-bottom:18px}
+.feat h3 .k{display:block;font-family:var(--mono);font-size:11px;letter-spacing:.16em;color:var(--blue);font-weight:400;margin-bottom:10px}
+.feat p{font-size:16px;color:var(--ink-soft);margin-bottom:16px}
+.feat p strong{color:var(--ink);font-weight:900}
+.feat .visual{display:flex;flex-direction:column;align-items:center;gap:16px}
+.feat.rev .visual{order:-1}
+
+/* ---------- curve ---------- */
+.curve-box{border:1.5px solid var(--ink);background:#FBFAF6;padding:24px 24px 16px;width:100%}
+.curve-box .cb-title{font-family:var(--mono);font-size:11px;letter-spacing:.14em;color:var(--gray);margin-bottom:14px}
+.curve-box svg{width:100%;height:auto;display:block}
+.curve-legend{display:flex;gap:22px;margin-top:10px;font-family:var(--mono);font-size:10.5px;color:var(--gray)}
+.curve-legend i{display:inline-block;width:16px;height:0;margin-right:6px;vertical-align:middle;border-top:2px solid var(--gray)}
+.curve-legend .l-blue i{border-top:2px solid var(--blue)}
+.curve-legend .l-gray i{border-top:2px dashed #B4B3A9}
+.cb-foot{font-family:var(--mono);font-size:10.5px;color:var(--gray);margin-top:10px;padding-top:10px;border-top:1px solid var(--line);line-height:1.8}
+
+/* ---------- grid ---------- */
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line);border:1px solid var(--line);margin-top:36px}
+.cell{background:var(--paper);padding:26px 26px 28px}
+.cell h3{font-size:17px;font-weight:900;margin-bottom:10px}
+.cell p{font-size:14.5px;line-height:1.85;color:var(--ink-soft);margin:0;max-width:none}
+
+/* ---------- install ---------- */
+.dl{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin:34px 0 8px}
+.dl a{display:block;text-decoration:none;border:1.5px solid var(--ink);padding:24px 26px;background:#FBFAF6;transition:transform .12s ease,box-shadow .12s ease}
+.dl a:hover{transform:translate(-2px,-2px);box-shadow:5px 5px 0 var(--blue)}
+.dl .dev{font-size:19px;font-weight:900;margin-bottom:4px}
+.dl .file{font-size:14px;color:var(--ink-soft)}
+.dl .arch{font-family:var(--mono);font-size:11px;color:var(--blue);letter-spacing:.08em;margin-top:10px}
+.install-note{font-size:14.5px;color:var(--gray);margin-top:18px}
+.install-note a{color:var(--blue);text-decoration:none;border-bottom:1px dashed var(--blue)}
+
+/* ---------- final ---------- */
+.fin{max-width:760px;margin:100px auto 0;padding:0 24px;text-align:center}
+.fin-in{border:1.5px solid var(--ink);background:#FBFAF6;padding:56px 32px}
+.fin h2{margin-bottom:14px}
+.fin p{color:var(--ink-soft);margin-bottom:30px}
+
+/* ---------- footer ---------- */
+footer{margin-top:100px;border-top:1px solid var(--line);background:var(--paper-deep)}
+.foot-in{max-width:760px;margin:0 auto;padding:48px 24px 56px}
+.foot-in p{font-size:13.5px;line-height:2;color:var(--gray);margin-bottom:18px;max-width:46em}
+.foot-in a{color:var(--blue);text-decoration:none;border-bottom:1px dashed var(--blue)}
+.foot-fin{font-family:var(--mono);font-size:12px;color:var(--gray);margin-top:28px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px}
+.foot-fin a{border:none}
+
+@media (max-width:880px){
+  .hero{grid-template-columns:1fr;padding-top:52px;gap:44px}
+  .device-wrap{order:2}
+  .grid,.dl,.fig-two{grid-template-columns:1fr}
+  .feat,.feat.rev{grid-template-columns:1fr;gap:36px}
+  .feat.rev .visual{order:0}
+  .strip-in{justify-content:flex-start;gap:8px 0}
+  .strip-in span{padding:0 12px}
+  .bar nav{gap:14px}
+  .bar nav a:nth-child(2),.bar nav a:nth-child(3){display:none}
+  .step{grid-template-columns:44px 1fr;gap:14px}
+}
+</style>
+</head>
+<body>
+
+<header class="bar">
+  <div class="bar-in">
+    <a class="logo" href="#top">rm-<b>weread</b></a>
+    <nav>
+      <a href="#read">阅读</a>
+      <a href="#underlines">共读</a>
+      <a href="#original">读原版</a>
+      <a href="#install">开始使用</a>
+      <a href="https://github.com/JIACHENG135/rm-weread">GitHub ↗</a>
+    </nav>
+  </div>
+</header>
+
+<!-- ================= HERO ================= -->
+<section class="hero" id="top">
+  <div>
+    <div class="eyebrow">FOR REMARKABLE 2 · PAPER PRO</div>
+    <h1>在 reMarkable 上，<br>读完你一直想读的<br><span class="nat">那本英文原版书</span></h1>
+    <p class="lede">你的微信读书书架，在这块最像纸的屏幕上。遇到生词，<button class="hl">圈一下，释义和例句就在那里<span class="hl-pop"><span class="who">◎ 圈词即译</span><span class="say">不切换 app，不放下笔，不打断你读到一半的那个句子。</span></span></button>；查过的词进入生词本，在你快要忘记的那天回来找你。</p>
+    <div class="ctas">
+      <a class="btn btn-primary" href="#install">开始使用</a>
+      <a class="btn btn-ghost" href="https://github.com/JIACHENG135/rm-weread">GitHub ↗</a>
+    </div>
+    <p class="hero-note">免费 · 开源 · 支持 reMarkable 2 与 Paper Pro</p>
+  </div>
+
+  <div class="device-wrap">
+    <div class="device">
+      <video src="assets/wordcard.mp4" autoplay loop muted playsinline preload="auto" aria-label="设备录屏：圈出一个生词，页面上立刻弹出释义与英文例句及其中文翻译"></video>
+    </div>
+    <p class="shot-note">设备实录 · 圈出一个词，释义和例句就在这一页上</p>
+  </div>
+</section>
+
+<div class="strip">
+  <div class="strip-in">
+    <span>你的微信读书书架</span>
+    <span>圈词即译</span>
+    <span>中英对照</span>
+    <span>遗忘曲线复习</span>
+    <span>真正的手写批注</span>
+  </div>
+</div>
+
+<!-- ================= CH 1 ================= -->
+<section class="chapter wide" id="read">
+  <div class="ch-mark"><span class="num">一</span><span class="label">阅读 / READING</span></div>
+  <div style="max-width:760px">
+    <h2>三步，把一本书<br>从书架搬到纸上</h2>
+    <p>不需要电脑，不需要导出导入，全程在平板上完成。选好的书直接出现在 reMarkable 自己的书库里，和你的笔记本、文档躺在一起。</p>
+    <div class="steps">
+      <div class="step"><div>
+        <h3>打开你的书架</h3>
+        <p>在书页上四指点击，或打开「微信读书」文件夹里的书架卡片——你的书架就在眼前，已经生成过的书带一个勾。</p>
+      </div></div>
+      <div class="step"><div>
+        <h3>选一本书</h3>
+        <p>点一下，进度条会告诉你正在处理哪一章。放下平板去倒杯水，回来就好了。</p>
+      </div></div>
+      <div class="step"><div>
+        <h3>开始读</h3>
+        <p>书出现在系统书库里：封面、版权页、内容简介、页码，一本完整的书。</p>
+      </div></div>
+    </div>
+  </div>
+
+  <div class="fig-two">
+    <figure class="fig">
+      <video src="assets/shelf.mp4" autoplay loop muted playsinline preload="auto" aria-label="设备录屏：从 reMarkable 文件列表打开微信读书文件夹，进入书架浏览器，选择《海蒂》英文原版"></video>
+      <figcaption><b>打开书架</b><span>「微信读书」就是文件列表里的一个文件夹。打开书架卡片，封面、书名、作者一目了然，带勾的已经生成过。</span></figcaption>
+    </figure>
+    <figure class="fig">
+      <video src="assets/openbook.mp4" autoplay loop muted playsinline preload="auto" aria-label="设备录屏：打开生成好的《海蒂》，依次是封面、版权与简介页、正文"></video>
+      <figcaption><b>它就是一本书</b><span>封面、书名页、出版社与内容简介，然后才是正文——用原生阅读器打开，翻页、目录、缩略图全都在。</span></figcaption>
+    </figure>
+  </div>
+</section>
+
+<!-- ================= CH 2 ================= -->
+<section class="chapter">
+  <div class="ch-mark"><span class="num">二</span><span class="label">批注 / ANNOTATION</span></div>
+  <h2>拿起笔就写，<br>就像在真正的书页上</h2>
+  <p>这不是一个「模仿」原生体验的阅读器——你读书用的<strong>就是 reMarkable 的原生阅读器</strong>。所以落笔的那一瞬间没有任何折扣：笔尖到墨迹的延迟、纸张般的摩擦感，和你写笔记本时一模一样。</p>
+  <p>在页边写下的批注、划出的重点、画的图，都是设备里堂堂正正的手写内容——可以导出，可以同步，永远跟着这本书。</p>
+  <div class="aside">
+    <span class="tag">你的笔迹，永远安全</span>
+    <p>书的内容更新时，已经写过批注的页面<strong>绝不会被覆盖</strong>。新版本会作为一本单独的「(更新版)」出现，你写下的每一笔都留在原处。</p>
+  </div>
+</section>
+
+<!-- ================= CH 3 ================= -->
+<section class="chapter wide" id="underlines">
+  <div class="ch-mark"><span class="num">三</span><span class="label">共读 / READING TOGETHER</span></div>
+  <div class="feat" style="margin-top:0">
+    <div>
+      <h2 style="margin-bottom:22px">几千个陌生读者，<br>和你读同一页纸</h2>
+      <p>微信读书最动人的部分，被完整地带了过来。当你翻到某一页，<button class="hl">其他读者划过的句子会浮现在纸面上<span class="hl-pop"><span class="who">◎ 热门划线</span><span class="say">「就像二手书里前一位读者留下的铅笔痕，只不过这本书被几千人读过。」</span></span></button>——不打扰，但你知道：这句话打动过很多人。</p>
+      <p>好奇他们为什么划？<button class="hl">用笔点一下那条线<span class="hl-pop"><span class="who">◎ 想法</span><span class="say">「深夜读到一句好话，还能看到别人为它写下的话。一个人读书，突然就不孤独了。」</span></span></button>，其他读者写下的想法就会出现。读完，合上，继续你自己的阅读。</p>
+      <p class="hl-hint">这段文字里的蓝色虚线也可以点，就像在设备上一样。</p>
+    </div>
+    <div class="visual">
+      <div class="device">
+        <video src="assets/comments.mp4" autoplay loop muted playsinline preload="auto" aria-label="设备录屏：在《海蒂》正文页上点击一处划线，浮出其他读者写下的想法，再点掉回到正文"></video>
+      </div>
+      <p class="shot-note">设备实录 · 点一下划线，别人的想法浮上来</p>
+    </div>
+  </div>
+</section>
+
+<!-- ================= CH 4 ================= -->
+<section class="chapter wide" id="original">
+  <div class="ch-mark"><span class="num">四</span><span class="label">读原版 / IN THE ORIGINAL</span></div>
+  <div style="max-width:760px">
+    <h2>为读英文原版而生：<br>查词不打断，查过不白查</h2>
+    <p>读原版最大的敌人从来不是词汇量，是<strong>每一次查词造成的中断</strong>，和查完第二天就忘的挫败。这两件事，各用一个功能解决。</p>
+  </div>
+
+  <!-- feature 1 -->
+  <div class="feat">
+    <div>
+      <h3><span class="k">圈词即译 / CIRCLE TO TRANSLATE</span>笔不离手，<br>心流不断</h3>
+      <p>读到不认识的词，<strong>用笔把它圈起来</strong>：释义、英文例句、例句的中文翻译，一起出现在这一页上。看完点掉，页面还是那一页。</p>
+      <p>整句读不通也一样——<strong>圈住一整段，中文就浮在旁边</strong>。不切换应用、不弹出键盘、不跳去别处，让查词便宜到几乎没有代价。</p>
+      <p>而且微信读书的原版书本身常常就是<strong>中英对照</strong>的：一段英文，一段中文，答案就在下面。</p>
+    </div>
+    <div class="visual">
+      <div class="device">
+        <video src="assets/translate.mp4" autoplay loop muted playsinline preload="auto" aria-label="设备录屏：圈选一整段英文，页面上浮出这段话的中文翻译"></video>
+      </div>
+      <p class="shot-note">设备实录 · 圈住整段，中文浮在原文旁边<br>（这段录在一份英文期刊上——同一套查词，在设备上的英文文档里一样用）</p>
+    </div>
+  </div>
+
+  <!-- feature 2 -->
+  <div class="feat rev">
+    <div class="visual">
+      <div class="device">
+        <video src="assets/review.mp4" autoplay loop muted playsinline preload="auto" aria-label="设备录屏：生词复习，一张张卡片依次出现，每张给出单词、中文释义和一句例句"></video>
+      </div>
+      <p class="shot-note">设备实录 · 生词一张张回来，带着例句</p>
+      <div class="curve-box">
+        <div class="cb-title">遗忘曲线：为什么要在特定的时点复习</div>
+        <svg viewBox="0 0 440 190" role="img" aria-label="艾宾浩斯遗忘曲线示意图：不复习时记忆快速滑落，每次复习把保持率重新拉回，且遗忘越来越慢">
+          <line x1="36" y1="12" x2="36" y2="156" stroke="#D7D6CD" stroke-width="1"/>
+          <line x1="36" y1="156" x2="428" y2="156" stroke="#D7D6CD" stroke-width="1"/>
+          <path d="M36 22 C 70 82, 120 122, 200 140 C 280 152, 360 155, 428 156" fill="none" stroke="#B4B3A9" stroke-width="1.8" stroke-dasharray="5 5"/>
+          <path d="M36 22 C 56 52, 72 70, 88 82 L 88 24 C 116 52, 140 66, 158 74 L 158 26 C 196 50, 224 60, 244 66 L 244 28 C 292 46, 330 52, 352 55 L 352 30 C 392 40, 416 43, 428 44" fill="none" stroke="#2E63C9" stroke-width="2.4" stroke-linejoin="round"/>
+          <g fill="#2E63C9"><circle cx="88" cy="82" r="3.4"/><circle cx="158" cy="74" r="3.4"/><circle cx="244" cy="66" r="3.4"/><circle cx="352" cy="55" r="3.4"/></g>
+          <g font-family="ui-monospace,Menlo,monospace" font-size="10.5" fill="#807F77">
+            <text x="72" y="174">第 1 次</text><text x="142" y="174">第 2 次</text><text x="228" y="174">第 3 次</text>
+            <text x="336" y="174">第 4 次</text><text x="8" y="26" fill="#4A4943">100%</text>
+          </g>
+        </svg>
+        <div class="curve-legend">
+          <span class="l-gray"><i></i>查完不复习</span>
+          <span class="l-blue"><i></i>按曲线复习</span>
+        </div>
+        <p class="cb-foot">原理示意图。每复习一次，记忆重新拉满，下一次滑落得更慢——所以间隔可以越拉越长。</p>
+      </div>
+    </div>
+    <div>
+      <h3><span class="k">遗忘曲线复习 / SPACED REPETITION</span>在你快要忘记的<br>那一刻，再见一面</h3>
+      <p>每个圈过的词都进入生词本，然后按<strong>艾宾浩斯遗忘曲线</strong>安排重逢：先隔一天，再隔几天，然后是一周、半个月——每次都赶在记忆滑落之前把它拉回来，间隔越拉越长，直到这个词真正属于你。</p>
+      <p>复习时给你看的不是孤零零的单词，而是<strong>一句用得上的例句</strong>。词义长在句子里，才记得牢。</p>
+      <p>每天几分钟，读完一本原版书，顺便收获几百个真正记住的词。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ================= CH 5 ================= -->
+<section class="chapter">
+  <div class="ch-mark"><span class="num">五</span><span class="label">承诺 / OUR PROMISES</span></div>
+  <h2>简单，<br>而且只属于你</h2>
+  <div class="grid">
+    <div class="cell">
+      <h3>没有第三方服务器</h3>
+      <p>你的账号和书只经过微信读书和你的设备，中间没有任何人经手。不注册、不收集、不上传。</p>
+    </div>
+    <div class="cell">
+      <h3>不打扰你的账号</h3>
+      <p>它安安静静地只做「读」这一件事：不替你标进度、不替你发想法，你的微信读书账号保持原样。</p>
+    </div>
+    <div class="cell">
+      <h3>开源，免费</h3>
+      <p>全部代码公开在 GitHub 上，任何人都可以审阅它做了什么、没做什么。没有付费墙，没有订阅。</p>
+    </div>
+    <div class="cell">
+      <h3>克制地使用网络</h3>
+      <p>只在需要时拉取需要的内容，对微信读书的服务器保持礼貌——这也是它能长久稳定使用的原因。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ================= CH 6 ================= -->
+<section class="chapter" id="install">
+  <div class="ch-mark"><span class="num">六</span><span class="label">开始使用 / GET STARTED</span></div>
+  <h2>选择你的设备，<br>十几分钟后开始阅读</h2>
+  <p>下载对应设备的安装文件，跟着安装指南一步一步来。装好之后，扫码登录微信读书，你的书架就到了。</p>
+  <div class="dl">
+    <a href="https://github.com/JIACHENG135/rm-weread/releases">
+      <div class="dev">reMarkable Paper Pro</div>
+      <div class="file">最新一代彩色墨水屏</div>
+      <div class="arch">下载 PAPER PRO 版本 ↓</div>
+    </a>
+    <a href="https://github.com/JIACHENG135/rm-weread/releases">
+      <div class="dev">reMarkable 2</div>
+      <div class="file">经典之作</div>
+      <div class="arch">下载 REMARKABLE 2 版本 ↓</div>
+    </a>
+  </div>
+  <p class="install-note">安装需要按照 <a href="https://github.com/JIACHENG135/rm-weread/blob/main/skills/install/SKILL.md">安装指南</a> 操作。指南写得足够细，照着做即可；遇到问题，欢迎到 <a href="https://github.com/JIACHENG135/rm-weread/issues">GitHub Issues</a> 提问。</p>
+</section>
+
+<div class="fin">
+  <div class="fin-in">
+    <h2>那本搁置很久的原版书，<br>这次能读完了</h2>
+    <p>免费、开源，随时可以卸载——但你大概不会想。</p>
+    <a class="btn btn-primary" href="https://github.com/JIACHENG135/rm-weread/releases">现在开始 ↗</a>
+  </div>
+</div>
+
+<footer>
+  <div class="foot-in">
+    <p>rm-weread 是一个开源的社区项目，站在 <a href="https://github.com/finlater/weread.koplugin">weread.koplugin</a>、<a href="https://github.com/nasonliu/REweread">REweread</a> 与 <a href="https://github.com/asivery">asivery</a> 的 XOVI 等项目的肩膀上。</p>
+    <p>仅供个人非商业使用。生成的书只存在于你自己的设备上，不上传、不分发。本项目与微信读书（腾讯）、reMarkable 均无关联。</p>
+    <div class="foot-fin">
+      <span>rm-weread</span>
+      <a href="https://github.com/JIACHENG135/rm-weread">github.com/JIACHENG135/rm-weread ↗</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+// hot-underline popovers
+document.querySelectorAll('.hl').forEach(function(el){
+  el.addEventListener('click',function(e){
+    e.stopPropagation();
+    var wasOpen=el.classList.contains('open');
+    document.querySelectorAll('.hl.open').forEach(function(o){o.classList.remove('open')});
+    if(!wasOpen)el.classList.add('open');
+  });
+});
+document.addEventListener('click',function(){
+  document.querySelectorAll('.hl.open').forEach(function(o){o.classList.remove('open')});
+});
+
+// respect reduced motion: no autoplay, give the user controls instead
+if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+  document.querySelectorAll('video').forEach(function(v){
+    v.autoplay=false; v.loop=false; v.controls=true; v.pause();
+  });
+}
+
+// only play what is on screen — keeps long pages calm and cheap
+if ('IntersectionObserver' in window) {
+  var io=new IntersectionObserver(function(entries){
+    entries.forEach(function(en){
+      var v=en.target;
+      if(v.controls) return;
+      if(en.isIntersecting){ var p=v.play(); if(p&&p.catch) p.catch(function(){}); }
+      else v.pause();
+    });
+  },{threshold:0.15});
+  document.querySelectorAll('video').forEach(function(v){io.observe(v)});
+}
+</script>
+</body>
+</html>
